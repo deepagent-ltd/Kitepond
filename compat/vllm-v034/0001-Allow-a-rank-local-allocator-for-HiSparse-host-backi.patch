@@ -1,0 +1,343 @@
+From 334f987ac9b7420751017e96e5cdd17c4840fcc6 Mon Sep 17 00:00:00 2001
+From: deepagent-ai <deepagent-ai@deepagent.ltd>
+Date: Thu, 19 Nov 2026 10:11:18 +0000
+Subject: [PATCH 1/7] Allow a rank-local allocator for HiSparse host backing
+
+---
+ docs/design/hisparse.md                       |  23 ++++
+ .../unit/test_hisparse_host_memory_lease.py   | 110 ++++++++++++++++++
+ tests/v1/worker/test_utils.py                 |   2 +-
+ vllm/config/kv_transfer.py                    |  15 ++-
+ vllm/v1/hisparse/runtime.py                   |  85 +++++++++++++-
+ 5 files changed, 229 insertions(+), 6 deletions(-)
+ create mode 100644 tests/v1/kv_connector/unit/test_hisparse_host_memory_lease.py
+
+diff --git a/docs/design/hisparse.md b/docs/design/hisparse.md
+index 2aa6c703..ca45b056 100644
+--- a/docs/design/hisparse.md
++++ b/docs/design/hisparse.md
+@@ -299,3 +299,26 @@ allocator, copy implementation, hot layout, and replacement policy should stay
+ platform-specific. NVIDIA uses the current accelerator LRU and fused host/hot
+ kernel. Other accelerators can implement `HiSparseBackend` and return its class
+ path from their platform override without changing the shared control flow.
++
++### External rank-local host backing
++
++By default HiSparse allocates and registers its own host pool. A deployment
++with TP1, PP1, PCP1 and DCP1 can supply a trusted allocator via
++`kv_connector_extra_config.host_pool_allocator` on `HiSparseConnector`,
++including when that connector is nested in `MultiConnector`. The same
++`host_pool_gib` config sizes the scheduler pool.
++
++vLLM resolves the Python callable by qualified name in the GPU worker. It
++calls the allocator once per engine lifetime with keyword arguments
++`instance_id`, `dp_rank` and page-rounded `size_bytes`. Return a
++`vllm.v1.hisparse.runtime.HiSparseHostMemoryLease` containing a contiguous
++one-dimensional CPU `torch.int8` tensor of exactly that size and a no-argument
++release callback. The buffer must start at a host page boundary and must be
++safe to register. Allocation may fail before the worker starts accepting
++requests.
++
++The worker owns exclusive use of that buffer and registers it for DMA. It
++returns the lease after GPU synchronization, unregister and cache detachment.
++A failed unregistration leaves the allocation leased until process cleanup.
++This interface grants backing for one DP owner. The scheduler continues owning
++all block IDs, free lists and readiness.
+diff --git a/tests/v1/kv_connector/unit/test_hisparse_host_memory_lease.py b/tests/v1/kv_connector/unit/test_hisparse_host_memory_lease.py
+new file mode 100644
+index 00000000..0e3e6868
+--- /dev/null
++++ b/tests/v1/kv_connector/unit/test_hisparse_host_memory_lease.py
+@@ -0,0 +1,110 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import mmap
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import torch
++
++from vllm.v1.hisparse import runtime
++
++
++def _config(*, nested=False, tp=1):
++    spec = {
++        "kv_connector": "HiSparseConnector",
++        "kv_connector_extra_config": {
++            "host_pool_gib": 1,
++            "host_pool_allocator": "my_plugin.acquire",
++        },
++    }
++    if nested:
++        spec = {
++            "kv_connector": "MultiConnector",
++            "kv_connector_extra_config": {"connectors": [spec]},
++        }
++    return SimpleNamespace(
++        instance_id="dp-owner",
++        parallel_config=SimpleNamespace(
++            tensor_parallel_size=tp,
++            pipeline_parallel_size=1,
++            prefill_context_parallel_size=1,
++            decode_context_parallel_size=1,
++            data_parallel_index=3,
++        ),
++        kv_transfer_config=SimpleNamespace(**spec),
++    )
++
++
++def _make_pool(monkeypatch, *, nested=False, tp=1, size_adjustment=0):
++    config = _config(nested=nested, tp=tp)
++    pool = runtime.HiSparseHostPool(
++        config, SimpleNamespace(hisparse_shared_host_pool=False)
++    )
++    size = mmap.PAGESIZE
++    base = torch.empty(2 * size, dtype=torch.int8)
++    offset = (-base.data_ptr()) % size
++    backing = base[offset : offset + size + size_adjustment]
++    release = Mock()
++    allocator = Mock(
++        return_value=runtime.HiSparseHostMemoryLease(backing, release)
++    )
++    pin = Mock()
++    monkeypatch.setattr(runtime, "_host_pools", {config.instance_id: pool})
++    monkeypatch.setattr(runtime, "resolve_obj_by_qualname", Mock(return_value=allocator))
++    monkeypatch.setattr(runtime, "pin_tensor", pin)
++    return config, pool, backing, allocator, pin, release
++
++
++@pytest.mark.parametrize("nested", [False, True])
++def test_external_backing_stays_leased_until_unregistered(monkeypatch, nested):
++    config, pool, backing, allocator, pin, release = _make_pool(
++        monkeypatch, nested=nested
++    )
++    view = pool.allocate(17)
++    assert view.shape == (17,)
++    assert view.data_ptr() == backing.data_ptr()
++    assert pool.allocate(17) is view
++    allocator.assert_called_once_with(
++        instance_id="dp-owner", dp_rank=3, size_bytes=mmap.PAGESIZE
++    )
++    pin.assert_called_once_with(backing)
++
++    runtime.drop_hisparse_host_pool(config)
++    release.assert_not_called()
++    assert runtime._host_pools[config.instance_id] is pool
++
++    # Emulate a successful release_pinned_state device sync and unregister.
++    pool.pinned.clear()
++    runtime.drop_hisparse_host_pool(config)
++    runtime.drop_hisparse_host_pool(config)
++    release.assert_called_once()
++    assert config.instance_id not in runtime._host_pools
++
++
++def test_invalid_backing_is_released_without_registration(monkeypatch):
++    _, pool, _, _, pin, release = _make_pool(monkeypatch, size_adjustment=-1)
++    with pytest.raises(ValueError, match="page-aligned CPU int8"):
++        pool.allocate(17)
++    pin.assert_not_called()
++    release.assert_called_once()
++    assert pool.backing is None
++
++
++def test_registration_failure_releases_lease(monkeypatch):
++    _, pool, _, _, pin, release = _make_pool(monkeypatch)
++    pin.side_effect = RuntimeError("registration failed")
++    with pytest.raises(RuntimeError, match="registration failed"):
++        pool.allocate(17)
++    release.assert_called_once()
++    assert pool.pinned == []
++    assert pool.backing is None
++
++
++def test_external_backing_rejects_multi_worker_group(monkeypatch):
++    _, pool, _, allocator, pin, release = _make_pool(monkeypatch, tp=2)
++    with pytest.raises(ValueError, match="TP1/PP1/PCP1/DCP1"):
++        pool.allocate(17)
++    allocator.assert_not_called()
++    pin.assert_not_called()
++    release.assert_not_called()
+diff --git a/tests/v1/worker/test_utils.py b/tests/v1/worker/test_utils.py
+index a68749e1..37825418 100644
+--- a/tests/v1/worker/test_utils.py
++++ b/tests/v1/worker/test_utils.py
+@@ -472,7 +472,7 @@ def test_shared_host_pool_registers_layer_spans_in_one_backing(monkeypatch):
+             ),
+         ],
+     )
+-    vllm_config = SimpleNamespace()
++    vllm_config = SimpleNamespace(kv_transfer_config=None)
+     pool = hisparse_runtime_module.HiSparseHostPool(vllm_config, config)
+     backing = pool.allocate(44)
+     allocate.assert_called_once_with(vllm_config, [12, 12, 20], 4, 16)
+diff --git a/vllm/config/kv_transfer.py b/vllm/config/kv_transfer.py
+index b406ede7..ef3fd50d 100644
+--- a/vllm/config/kv_transfer.py
++++ b/vllm/config/kv_transfer.py
+@@ -13,9 +13,9 @@ KVConsumer = Literal["kv_consumer", "kv_both"]
+ KVRole = Literal[KVProducer, KVConsumer]
+ 
+ 
+-def hisparse_host_pool_gib(
++def hisparse_connector_extra_config(
+     kv_transfer_config: "KVTransferConfig | None",
+-) -> float | None:
++) -> dict[str, Any] | None:
+     if kv_transfer_config is None:
+         return None
+     if kv_transfer_config.kv_connector == "MultiConnector":
+@@ -36,9 +36,16 @@ def hisparse_host_pool_gib(
+     ]
+     if len(entries) > 1:
+         raise ValueError("Only one HiSparseConnector may be configured")
+-    if not entries:
++    return entries[0] if entries else None
++
++
++def hisparse_host_pool_gib(
++    kv_transfer_config: "KVTransferConfig | None",
++) -> float | None:
++    extra_config = hisparse_connector_extra_config(kv_transfer_config)
++    if extra_config is None:
+         return None
+-    host_pool_gib = entries[0].get("host_pool_gib")
++    host_pool_gib = extra_config.get("host_pool_gib")
+     if host_pool_gib is None:
+         raise ValueError("HiSparseConnector requires host_pool_gib")
+     host_pool_gib = float(host_pool_gib)
+diff --git a/vllm/v1/hisparse/runtime.py b/vllm/v1/hisparse/runtime.py
+index 7bfb8ecc..bf772097 100644
+--- a/vllm/v1/hisparse/runtime.py
++++ b/vllm/v1/hisparse/runtime.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import mmap
+ import time
+ from collections.abc import Callable, Mapping, Sequence
+ from dataclasses import dataclass
+@@ -14,11 +15,13 @@ import psutil
+ import torch
+ 
+ from vllm.config import CUDAGraphMode, VllmConfig
++from vllm.config.kv_transfer import hisparse_connector_extra_config
+ from vllm.distributed import get_tp_group
+ from vllm.forward_context import get_forward_context, in_piecewise_cudagraph
+ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+ from vllm.utils.host_memory import host_registration_ranges
++from vllm.utils.import_utils import resolve_obj_by_qualname
+ from vllm.utils.math_utils import cdiv, round_up
+ from vllm.utils.mem_utils import get_max_shared_memory_bytes
+ from vllm.utils.torch_utils import async_tensor_h2d
+@@ -228,6 +231,18 @@ def pin_tensor(tensor: torch.Tensor) -> None:
+     get_hisparse_backend().pin_tensor(tensor)
+ 
+ 
++@dataclass(frozen=True)
++class HiSparseHostMemoryLease:
++    """Unregistered, exclusive backing owned by an external allocator.
++
++    The buffer is one page-aligned CPU int8 vector. Only the worker may use it
++    until release is called after CUDA synchronization and host unregister.
++    """
++
++    buffer: torch.Tensor
++    release: Callable[[], None]
++
++
+ class HiSparseHostPool:
+     """Keep the single host backing and its exact registration range."""
+ 
+@@ -238,11 +253,69 @@ class HiSparseHostPool:
+         self.registered: torch.Tensor | None = None
+         self.shared_region: SharedOffloadRegion | None = None
+         self.pinned: list[torch.Tensor] = []
++        self.external_lease: HiSparseHostMemoryLease | None = None
++
++    def _allocate_external(self, size: int, allocator_path: str) -> torch.Tensor:
++        parallel = self.vllm_config.parallel_config
++        if self.kv_cache_config.hisparse_shared_host_pool or (
++            parallel.tensor_parallel_size,
++            parallel.pipeline_parallel_size,
++            parallel.prefill_context_parallel_size,
++            parallel.decode_context_parallel_size,
++        ) != (1, 1, 1, 1):
++            raise ValueError(
++                "An external HiSparse host allocator requires TP1/PP1/PCP1/DCP1."
++            )
++        allocator = resolve_obj_by_qualname(allocator_path)
++        registered_size = round_up(size, mmap.PAGESIZE)
++        lease = allocator(
++            instance_id=self.vllm_config.instance_id,
++            dp_rank=parallel.data_parallel_index,
++            size_bytes=registered_size,
++        )
++        if not isinstance(lease, HiSparseHostMemoryLease):
++            raise TypeError(
++                "External allocator must return HiSparseHostMemoryLease."
++            )
++        try:
++            buffer = lease.buffer
++            if (
++                not isinstance(buffer, torch.Tensor)
++                or buffer.device.type != "cpu"
++                or buffer.dtype != torch.int8
++                or buffer.shape != (registered_size,)
++                or not buffer.is_contiguous()
++                or buffer.data_ptr() % mmap.PAGESIZE != 0
++            ):
++                raise ValueError(
++                    "External HiSparse backing must be a page-aligned CPU int8 "
++                    "vector with the requested size."
++                )
++            pin_tensor(buffer)
++        except Exception:
++            lease.release()
++            raise
++        self.external_lease = lease
++        self.pinned = [buffer]
++        self.registered = buffer
++        self.backing = buffer[:size]
++        return self.backing
+ 
+     def allocate(self, size: int) -> torch.Tensor:
+         if self.backing is not None:
+             assert self.backing.numel() == size, "HiSparse host pool size changed."
+             return self.backing
++        extra_config = hisparse_connector_extra_config(
++            self.vllm_config.kv_transfer_config
++        )
++        allocator_path = (extra_config or {}).get("host_pool_allocator")
++        if allocator_path is not None:
++            if not isinstance(allocator_path, str) or "." not in allocator_path:
++                raise ValueError(
++                    "host_pool_allocator must be a qualified Python name."
++                )
++            return self._allocate_external(size, allocator_path)
++
+         config = self.kv_cache_config
+         if config.hisparse_shared_host_pool:
+             tensor_sizes = [
+@@ -285,7 +358,17 @@ def get_hisparse_host_pool(
+ 
+ 
+ def drop_hisparse_host_pool(vllm_config: VllmConfig) -> None:
+-    _host_pools.pop(vllm_config.instance_id, None)
++    instance_id = vllm_config.instance_id
++    pool = _host_pools.get(instance_id)
++    if pool is not None and pool.external_lease is not None:
++        if pool.pinned:
++            # Device synchronization or unregister failed. Keep the lease and
++            # let process exit reclaim registered memory.
++            return
++        pool.backing = None
++        pool.registered = None
++        pool.external_lease.release()
++    _host_pools.pop(instance_id, None)
+ 
+ 
+ def use_shared_hisparse_host_pool(vllm_config: VllmConfig) -> bool:

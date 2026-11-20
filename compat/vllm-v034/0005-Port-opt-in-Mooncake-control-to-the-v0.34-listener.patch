@@ -1,0 +1,274 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+index f90a26ce448f6c63a7b7e75561024f701049a27d..3fd2b34fc908f09025f88a5d0da03ac8bfce0f3b 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+@@ -9,7 +9,7 @@ import secrets
+ import threading
+ import time
+ from collections import OrderedDict, defaultdict
+-from collections.abc import Collection
++from collections.abc import Awaitable, Callable, Collection
+ from concurrent.futures import ThreadPoolExecutor
+ from dataclasses import dataclass
+ from enum import IntEnum
+@@ -49,6 +49,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
+     MooncakeBootstrapServer,
+     RegisterWorkerPayload,
+ )
++from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.named_control import (
++    decode_mooncake_control_message,
++    validate_mooncake_control_body,
++    validate_mooncake_control_name,
++)
+ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
+     MooncakeKVConnectorStats,
+     MooncakePromMetrics,
+@@ -1565,6 +1570,11 @@ class MooncakeConnectorWorker:
+         self._xfer_meta_decoder = msgspec.msgpack.Decoder(MooncakeXferMetadata)
+         self._xfer_resp_decoder = msgspec.msgpack.Decoder(MooncakeXferResponse)
+         self._heartbeat_decoder = msgspec.msgpack.Decoder(MooncakeLeaseHeartbeat)
++        self._named_control_handlers: dict[
++            str, Callable[[bytes], Awaitable[bytes]]
++        ] = {}
++        self._named_control_listener_task: asyncio.Task | None = None
++        self._named_control_only = False
+ 
+     def _sync_block_size_with_kernel(self) -> None:
+         # When speculative decoding (e.g. Eagle) is enabled, the main model
+@@ -1597,6 +1607,12 @@ class MooncakeConnectorWorker:
+ 
+     def shutdown(self):
+         """Cleanup background threads on destruction."""
++        if self._named_control_handlers and self.sender_loop.is_running():
++            # Async ROUTER receives must release their socket before Context.term.
++            stopped = asyncio.run_coroutine_threadsafe(
++                self._stop_named_control_listener(), self.sender_loop
++            )
++            stopped.result()
+         self.async_zmq_ctx.term()
+         if not self.is_kv_consumer:
+             self._sender_executor.shutdown(wait=False)
+@@ -1673,39 +1689,46 @@ class MooncakeConnectorWorker:
+             self.side_channel_port,
+         )
+ 
+-        await self.register_worker_with_bootstrap()
+-
+-        # Create async worker tasks that process items from the queue
+-        sender_tasks = [
+-            asyncio.create_task(self._sender_worker(sock))
+-            for _ in range(self.num_sender_tasks)
+-        ]
++        if self._named_control_handlers:
++            self._named_control_listener_task = asyncio.current_task()
++        sender_tasks: list[asyncio.Task] = []
++        try:
++            await self.register_worker_with_bootstrap()
+ 
+-        ready_event.set()
++            # Create async worker tasks that process items from the queue
++            sender_tasks = [
++                asyncio.create_task(self._sender_worker(sock))
++                for _ in range(self.num_sender_tasks)
++            ]
+ 
+-        try:
+-            while True:
+-                identity, metadata_bytes = await sock.recv_multipart()
+-                # Renew here, not in a sender worker: those can all be
+-                # waiting for prefills, and the renewal must not wait.
+-                heartbeat = self._decode_heartbeat(metadata_bytes)
+-                if heartbeat is not None:
+-                    response = self._renew_kv_leases(heartbeat.lease_transfer_ids)
+-                    await sock.send_multipart(
+-                        (identity, self._encoder.encode(response))
++            ready_event.set()
++            try:
++                while True:
++                    identity, metadata_bytes = await sock.recv_multipart()
++                    # Renew here, not in a sender worker: those can all be
++                    # waiting for prefills, and the renewal must not wait.
++                    heartbeat = (
++                        None if self._named_control_only
++                        else self._decode_heartbeat(metadata_bytes)
+                     )
+-                    continue
+-                await self.sender_worker_queue.put((identity, metadata_bytes))
+-        except zmq.ContextTerminated:
+-            logger.debug("ZMQ context terminated, exiting Mooncake sender thread.")
+-        except Exception as e:
+-            logger.error("Error in Mooncake sender thread: %s. Exiting thread.", str(e))
++                    if heartbeat is not None:
++                        response = self._renew_kv_leases(heartbeat.lease_transfer_ids)
++                        await sock.send_multipart(
++                            (identity, self._encoder.encode(response))
++                        )
++                        continue
++                    await self.sender_worker_queue.put((identity, metadata_bytes))
++            except zmq.ContextTerminated:
++                logger.debug("ZMQ context terminated, exiting Mooncake sender thread.")
++            except Exception as e:
++                logger.error("Error in Mooncake sender thread: %s. Exiting thread.", str(e))
+         finally:
+             # Clean up worker tasks
+             for task in sender_tasks:
+                 task.cancel()
+             await asyncio.gather(*sender_tasks, return_exceptions=True)
+             sock.close()
++            self._named_control_listener_task = None
+ 
+     def _decode_heartbeat(self, message: bytes) -> MooncakeLeaseHeartbeat | None:
+         try:
+@@ -1730,11 +1753,61 @@ class MooncakeConnectorWorker:
+                 send_meta.expire_time = max(send_meta.expire_time, new_expire_time)
+         return MooncakeXferResponse(status=MooncakeXferResponseStatus.FINISH)
+ 
++    async def _stop_named_control_listener(self) -> None:
++        listener = self._named_control_listener_task
++        if listener is not None:
++            listener.cancel()
++            await asyncio.gather(listener, return_exceptions=True)
++
++    def bind_named_control_handler(
++        self,
++        namespace: str,
++        handler: Callable[[bytes], Awaitable[bytes]],
++        *,
++        reject_native_requests: bool = False,
++    ) -> None:
++        """Explicitly bind an authenticated control handler before P listens."""
++        validate_mooncake_control_name(namespace)
++        if (
++            self.is_kv_consumer
++            or type(reject_native_requests) is not bool
++            or self.side_channel_port
++            or namespace in self._named_control_handlers
++            or not callable(handler)
++        ):
++            raise ValueError("Mooncake control handler must bind once before listening")
++        self._named_control_handlers[namespace] = handler
++        self._named_control_only |= reject_native_requests
++
++    async def _dispatch_named_control(self, identity, sock, packet) -> bool:
++        control = decode_mooncake_control_message(packet)
++        if control is None:
++            return False
++        namespace, body = control
++        handler = self._named_control_handlers.get(namespace)
++        if handler is None:
++            raise ValueError("Mooncake control namespace is unavailable")
++        response = await handler(body)
++        validate_mooncake_control_body(response)
++        await sock.send_multipart((identity, response))
++        return True
++
+     async def _sender_worker(self, sock: zmq.asyncio.Socket):
+         while True:
+             try:
+                 identity, metadata_bytes = await self.sender_worker_queue.get()
+                 try:
++                    if (
++                        self._named_control_handlers
++                        and await self._dispatch_named_control(
++                            identity, sock, metadata_bytes
++                        )
++                    ):
++                        continue
++                    if self._named_control_only:
++                        raise ValueError(
++                            "This Mooncake producer requires named control"
++                        )
+                     metadata = self._xfer_meta_decoder.decode(metadata_bytes)
+                     await self.send_kv_to_decode(identity, sock, metadata)
+                 except Exception as e:
+@@ -2857,6 +2930,39 @@ class MooncakeConnectorWorker:
+         self._pending_bootstrap_queries[remote_bootstrap_addr].set()
+         del self._pending_bootstrap_queries[remote_bootstrap_addr]
+ 
++    async def resolve_named_control_peer(
++        self, remote_engine_id: EngineId, bootstrap_address: str
++    ) -> str:
++        """Discover the same TP/PP peer through the native bootstrap registry."""
++        if self.is_kv_producer or asyncio.get_running_loop() is not self.receiver_loop:
++            raise ValueError("Mooncake control discovery requires the D receiver loop")
++
++        def peer():
++            return (
++                self._remote_agents.get(remote_engine_id, {})
++                .get(self.tp_rank, {})
++                .get(self.pp_rank)
++            )
++
++        address = peer()
++        if address is None:
++            ready = self._pending_bootstrap_queries.get(bootstrap_address)
++            if ready is None:
++                ready = asyncio.Event()
++                self._pending_bootstrap_queries[bootstrap_address] = ready
++                try:
++                    await self._connect_to_prefiller_bootstrap(bootstrap_address)
++                finally:
++                    if self._pending_bootstrap_queries.get(bootstrap_address) is ready:
++                        del self._pending_bootstrap_queries[bootstrap_address]
++                        ready.set()
++            else:
++                await ready.wait()
++            address = peer()
++        if address is None:
++            raise ValueError("Mooncake named control peer is absent from bootstrap")
++        return address
++
+     def _select_remote_workers(
+         self, remote_engine_id: EngineId
+     ) -> dict[int, list[int]]:
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/named_control.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/named_control.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2cfeece3db7eae10f2ab0aa7966008f9020beca8
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/named_control.py
+@@ -0,0 +1,45 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""An explicitly bound control frame on Mooncake's native peer socket."""
++
++from typing import Final
++
++# c1 is reserved by MessagePack and cannot prefix a native request.
++_CONTROL_FRAME: Final = b"\xc1vllm-mc-control\x01"
++MOONCAKE_CONTROL_BODY_MAX: Final = 192 * 1024
++_NAME_CHARS: Final = frozenset(b"abcdefghijklmnopqrstuvwxyz0123456789._-")
++
++
++def validate_mooncake_control_name(name: str) -> bytes:
++    if type(name) is not str or not name.isascii():
++        raise ValueError("Invalid Mooncake control namespace")
++    value = name.encode("ascii")
++    if not 1 <= len(value) <= 63 or not all(char in _NAME_CHARS for char in value):
++        raise ValueError("Invalid Mooncake control namespace")
++    return value
++
++
++def validate_mooncake_control_body(data: bytes) -> None:
++    if type(data) is not bytes or not 0 < len(data) <= MOONCAKE_CONTROL_BODY_MAX:
++        raise ValueError("Invalid Mooncake control body length")
++
++
++def encode_mooncake_control_message(name: str, data: bytes) -> bytes:
++    namespace = validate_mooncake_control_name(name)
++    validate_mooncake_control_body(data)
++    return _CONTROL_FRAME + namespace + b"\x00" + data
++
++
++def decode_mooncake_control_message(packet: bytes) -> tuple[str, bytes] | None:
++    if not packet.startswith(_CONTROL_FRAME):
++        return None
++    if len(packet) > len(_CONTROL_FRAME) + 64 + MOONCAKE_CONTROL_BODY_MAX:
++        raise ValueError("Invalid Mooncake control frame length")
++    frame = packet[len(_CONTROL_FRAME) :]
++    name, separator, body = frame.partition(b"\x00")
++    if not separator or not name.isascii():
++        raise ValueError("Invalid Mooncake control namespace")
++    namespace = name.decode("ascii")
++    validate_mooncake_control_name(namespace)
++    validate_mooncake_control_body(body)
++    return namespace, body

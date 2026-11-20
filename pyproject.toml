@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kitepond"
+version = "0.1.0"
+description = "Kitepond cache integration tools"
+requires-python = ">=3.12"
+license = {file = "LICENSE"}
+
+[project.optional-dependencies]
+fsl2 = ["lmcache==0.5.6"]
+observability = ["prometheus-client==0.24.1"]
+mooncake-cu13 = ["mooncake-transfer-engine-cuda13==0.3.14"]
+
+[project.scripts]
+kitepond = "kitepond.ops.cli:main"
+kitepond-dp8 = "kitepond.dp8:main"
+kitepond-glm-native = "kitepond.glm_native:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+kitepond = ["v034-runtime.zip"]

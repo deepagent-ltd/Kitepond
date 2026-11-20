@@ -1,0 +1,316 @@
+diff --git a/tests/v1/executor/test_multiproc_rpc_timeout.py b/tests/v1/executor/test_multiproc_rpc_timeout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..31e64d45562dcbde23b5866dc53bad1082265cb9
+--- /dev/null
++++ b/tests/v1/executor/test_multiproc_rpc_timeout.py
+@@ -0,0 +1,174 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import multiprocessing as mp
++import os
++from collections import deque
++from contextlib import contextmanager
++from dataclasses import fields
++from threading import Lock
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
++from vllm.v1.core.sched.output import SchedulerOutput
++from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
++from vllm.v1.outputs import ModelRunnerOutput
++
++LATE = {"utility": "old-owner-response"}
++REQUEST = SchedulerOutput.make_empty()
++MODEL_OUTPUT_FIELDS = {field.name for field in fields(ModelRunnerOutput)}
++MODEL_OUTPUT_REQ_ID = "synthetic-new-model-request"
++MODEL_OUTPUT_EXTRA = (
++    {"req_id_to_index": {MODEL_OUTPUT_REQ_ID: 0}}
++    if "req_id_to_index" in MODEL_OUTPUT_FIELDS
++    else {}
++)
++FRESH = ModelRunnerOutput(req_ids=[MODEL_OUTPUT_REQ_ID], **MODEL_OUTPUT_EXTRA)
++
++
++class CpuWorker:
++    def __init__(self, rank, delayed_rank, entered, complete):
++        self.rank = rank
++        self.delayed_rank = delayed_rank
++        self.entered = entered
++        self.complete = complete
++
++    def owner_resolve(self):
++        if self.rank == self.delayed_rank:
++            self.entered.set()
++            if not self.complete.wait(10):
++                raise RuntimeError("CPU fixture did not release the delayed owner call")
++            return LATE
++        return {"utility": "first-rank-response"}
++
++    def execute_model(self, scheduler_output):
++        assert isinstance(scheduler_output, SchedulerOutput)
++        return FRESH
++
++
++def run_worker(rank, requests, send_reply, delayed_rank, entered, complete):
++    replies = MessageQueue(1, 1, max_chunk_bytes=64 * 1024, max_chunks=4)
++    send_reply.send(replies.export_handle())
++    send_reply.close()
++    worker = WorkerProc.__new__(WorkerProc)
++    worker.rank = rank
++    worker.worker = CpuWorker(rank, delayed_rank, entered, complete)
++    worker.use_async_scheduling = False
++    worker.rpc_broadcast_mq = MessageQueue.create_from_handle(requests, rank)
++    worker.worker_response_mq = replies
++    worker.rpc_broadcast_mq.wait_until_ready()
++    replies.wait_until_ready()
++    worker.worker_busy_loop()
++
++
++@contextmanager
++def native_executor(delayed_rank):
++    ctx = mp.get_context("spawn")
++    requests = MessageQueue(2, 2, max_chunk_bytes=64 * 1024, max_chunks=4)
++    entered, complete = ctx.Event(), ctx.Event()
++    workers, replies, handles = [], [], []
++    try:
++        for rank in range(2):
++            recv_reply, send_reply = ctx.Pipe(duplex=False)
++            proc = ctx.Process(
++                target=run_worker,
++                args=(
++                    rank,
++                    requests.export_handle(),
++                    send_reply,
++                    delayed_rank,
++                    entered,
++                    complete,
++                ),
++            )
++            proc.start()
++            workers.append(proc)
++            send_reply.close()
++            handles.append(recv_reply)
++        for handle in handles:
++            assert handle.poll(20), "CPU worker transport did not publish its queue"
++            replies.append(MessageQueue.create_from_handle(handle.recv(), 0))
++        requests.wait_until_ready()
++        for reply in replies:
++            reply.wait_until_ready()
++
++        executor = MultiprocExecutor.__new__(MultiprocExecutor)
++        executor.is_failed = False
++        executor.failure_callback = None
++        executor._failure_lock = Lock()
++        executor.rpc_broadcast_mq = requests
++        executor.response_mqs = replies
++        executor.futures_queue = deque()
++        executor.output_rank = delayed_rank
++        executor.kv_output_aggregator = None
++        executor.ec_output_aggregator = None
++        executor.vllm_config = SimpleNamespace(
++            parallel_config=SimpleNamespace(enable_fault_tolerance=False)
++        )
++        notifications = []
++        executor.register_failure_callback(lambda: notifications.append("failed"))
++        assert executor.execute_model(REQUEST) == FRESH
++        yield executor, entered, complete, notifications
++    finally:
++        complete.set()
++        for worker in workers:
++            worker.terminate()
++        for worker in workers:
++            worker.join(3)
++            if worker.is_alive():
++                worker.kill()
++                worker.join(3)
++        for handle in handles:
++            handle.close()
++        for queue in (*replies, requests):
++            queue.shutdown()
++
++
++@pytest.mark.parametrize("output_rank", [0, 1])
++def test_execute_after_a_timed_out_owner_call(output_rank):
++    with native_executor(output_rank) as (executor, entered, complete, notifications):
++        with pytest.raises(TimeoutError, match="RPC call to owner_resolve timed out"):
++            executor.collective_rpc("owner_resolve", timeout=0.3)
++        assert entered.is_set(), "the selected worker must really have the timed RPC"
++        complete.set()
++        try:
++            result = executor.execute_model(REQUEST)
++        except RuntimeError as error:
++            assert str(error) == "Executor failed."
++        else:
++            assert result != LATE, "native execute_model consumed the delayed utility reply"
++            pytest.fail("the timed-out executor accepted a replacement model RPC")
++        assert notifications == ["failed"]
++        assert not executor.futures_queue
++
++
++def test_enqueued_model_future_cannot_consume_late_owner_reply():
++    with native_executor(1) as (executor, entered, complete, notifications):
++        owner_future = executor.collective_rpc(
++            "owner_resolve", timeout=0.3, non_block=True
++        )
++        assert entered.wait(5)
++        model_future = executor.execute_model(REQUEST, non_block=True)
++        with pytest.raises(TimeoutError, match="RPC call to owner_resolve timed out"):
++            owner_future.result()
++
++        if os.environ.get("VLLM_RPC_EXPECT_UNPATCHED") == "1":
++            # Drive the old executor to a ready reply before checking output
++            # provenance. On the fixed executor poll resolves while the
++            # original worker is still waiting, with no response available.
++            complete.set()
++            try:
++                result = model_future.result()
++            except RuntimeError as error:
++                assert str(error) == "Executor failed."
++            else:
++                assert result != LATE, "native model future consumed the delayed reply"
++                pytest.fail("the executor accepted an enqueued model response")
++        else:
++            assert model_future.poll(), "poisoned futures must finish without a late frame"
++            with pytest.raises(RuntimeError, match="Executor failed."):
++                model_future.result()
++        assert notifications == ["failed"]
++        assert not executor.futures_queue
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index af8d8bf3dc6309a886fc98ec276cad7cffd43c7b..acc695aff317b6effd0a814edaa0f0e159f56e2c 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -151,6 +151,7 @@ class MultiprocExecutor(Executor):
+ 
+     def __init__(self, vllm_config: VllmConfig, monitor_workers: bool = True):
+         self.monitor_workers = monitor_workers
++        self._failure_lock = threading.Lock()
+         super().__init__(vllm_config)
+ 
+     def _init_executor(self) -> None:
+@@ -399,7 +400,7 @@ class MultiprocExecutor(Executor):
+             if not _self or getattr(_self, "shutting_down", False):
+                 logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
+                 return
+-            _self.is_failed = True
++            callback = _self._take_failure_callback()
+             proc = next(h.proc for h in workers if h.proc.sentinel == died[0])
+             logger.error(
+                 "Worker proc %s died unexpectedly (exit code: %s), "
+@@ -408,9 +409,7 @@ class MultiprocExecutor(Executor):
+                 proc.exitcode,
+             )
+             _self.shutdown()
+-            callback = _self.failure_callback
+             if callback is not None:
+-                _self.failure_callback = None
+                 callback()
+ 
+         if not inline:
+@@ -421,11 +420,21 @@ class MultiprocExecutor(Executor):
+ 
+         monitor_workers()
+ 
++    def _take_failure_callback(self) -> FailureCallback | None:
++        with self._failure_lock:
++            if self.is_failed:
++                return None
++            self.is_failed = True
++            callback = self.failure_callback
++            self.failure_callback = None
++            return callback
++
+     def register_failure_callback(self, callback: FailureCallback):
+-        if self.is_failed:
+-            callback()
+-        else:
+-            self.failure_callback = callback
++        with self._failure_lock:
++            if not self.is_failed:
++                self.failure_callback = callback
++                return
++        callback()
+ 
+     def execute_model(  # type: ignore[override]
+         self, scheduler_output: SchedulerOutput, non_block: bool = False
+@@ -481,11 +490,11 @@ class MultiprocExecutor(Executor):
+     ) -> Any:
+         """Returns single result if unique_reply_rank and/or an output
+         aggregator is provided, otherwise list."""
++        if self.is_failed:
++            raise RuntimeError("Executor failed.")
+         assert self.rpc_broadcast_mq is not None, (
+             "collective_rpc should not be called on follower node"
+         )
+-        if self.is_failed:
+-            raise RuntimeError("Executor failed.")
+ 
+         deadline = None if timeout is None else time.monotonic() + timeout
+         kwargs = kwargs or {}
+@@ -520,6 +529,8 @@ class MultiprocExecutor(Executor):
+             response_mqs = (response_mqs[output_rank],)
+ 
+         def get_response():
++            if self.is_failed:
++                raise RuntimeError("Executor failed.")
+             responses = []
+             has_failure = False
+ 
+@@ -530,6 +541,14 @@ class MultiprocExecutor(Executor):
+                 try:
+                     status, result = mq.dequeue(timeout=dequeue_timeout)
+                 except TimeoutError as e:
++                    # Rank queues are FIFO with no RPC identity in the response.
++                    # A late reply from this call must never reach a later future.
++                    callback = self._take_failure_callback()
++                    if callback is not None:
++                        try:
++                            callback()
++                        except Exception:
++                            logger.exception("Executor failure callback failed")
+                     raise TimeoutError(f"RPC call to {method} timed out.") from e
+ 
+                 if status == WorkerProc.ResponseStatus.FAILURE_WITH_KV_OUTPUT:
+@@ -574,6 +593,8 @@ class MultiprocExecutor(Executor):
+             return responses[0] if output_rank is not None else responses
+ 
+         def wait_for_response(pending: Sized, deadline: float) -> None:
++            if self.is_failed:
++                return
+             for mq in response_mqs:
+                 if not mq.readable():
+                     mq.spin_until_readable(pending, deadline)
+@@ -583,7 +604,8 @@ class MultiprocExecutor(Executor):
+             self.futures_queue,
+             get_response=get_response,
+             aggregate=aggregate,
+-            response_ready=lambda: all(mq.readable() for mq in response_mqs),
++            response_ready=lambda: self.is_failed
++            or all(mq.readable() for mq in response_mqs),
+             wait_for_response=wait_for_response,
+         )
+ 
+diff --git a/vllm/v1/executor/ray_executor_v2.py b/vllm/v1/executor/ray_executor_v2.py
+index 63c3ff0fbea63f729661c1e03f5bebf6c5429a60..916bd63ada74bed7cf0f167b8bba044f8c8027b3 100644
+--- a/vllm/v1/executor/ray_executor_v2.py
++++ b/vllm/v1/executor/ray_executor_v2.py
+@@ -518,15 +518,13 @@ class RayExecutorV2(MultiprocExecutor):
+                 executor = self_ref()
+                 if not executor:
+                     return
+-                executor.is_failed = True
++                callback = executor._take_failure_callback()
+                 logger.error(
+                     "RayWorkerProc rank=%s died unexpectedly, shutting down executor.",
+                     dead_ranks,
+                 )
+                 executor.shutdown()
+-                if executor.failure_callback is not None:
+-                    callback = executor.failure_callback
+-                    executor.failure_callback = None
++                if callback is not None:
+                     callback()
+                 return
+ 

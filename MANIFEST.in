@@ -1,0 +1,5 @@
+include README.md README.zh-CN.md LICENSE
+recursive-include compat/vllm-v034 *.patch
+recursive-include tools *.py *.sh
+recursive-include examples *.sh
+recursive-include tests *.py *.json

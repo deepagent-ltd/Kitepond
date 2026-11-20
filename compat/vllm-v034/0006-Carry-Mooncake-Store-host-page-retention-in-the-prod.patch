@@ -1,0 +1,540 @@
+From cfc3df40d27f771cf26ded89c8b6d8201dbe1d39 Mon Sep 17 00:00:00 2001
+From: deepagent-ai <deepagent-ai@deepagent.ltd>
+Date: Fri, 20 Nov 2026 03:14:50 +0000
+Subject: [PATCH 6/7] Carry Mooncake Store host-page retention in the product
+ runtime
+
+---
+ .../unit/test_mooncake_store_scheduler.py     | 146 +++++++++++++++---
+ .../v1/mooncake/store/connector.py            |   7 +-
+ .../v1/mooncake/store/scheduler.py            | 115 ++++++++------
+ vllm/v1/core/kv_cache_manager.py              |   5 +
+ 4 files changed, 204 insertions(+), 69 deletions(-)
+
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py b/tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py
+index b95bbf70..51c20f5f 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py
+@@ -1,12 +1,16 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from dataclasses import replace
+ from types import SimpleNamespace
+ from unittest.mock import patch
+ 
+ import pytest
+ import torch
+ 
++from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import (
++    MooncakeStoreConnector,
++)
+ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (
+     MooncakeStoreCoordinator,
+ )
+@@ -24,7 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler impor
+     _partial_tail_non_mamba_puts,
+ )
+ from vllm.v1.core.block_pool import BlockPool
+-from vllm.v1.core.kv_cache_manager import KVCacheBlocks
++from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.kv_cache_utils import KVCacheBlock
+ from vllm.v1.core.sched.output import KVConnectorBlockState
+ from vllm.v1.kv_cache_interface import (
+@@ -36,6 +40,29 @@ from vllm.v1.kv_cache_interface import (
+ )
+ 
+ 
++def _pinned_block_ids(scheduler, store_job_id):
++    by_pool, _ = scheduler._pinned_saves[store_job_id]
++    return [block.block_id for blocks in by_pool.values() for block in blocks]
++
++
++def _bind_host_group(scheduler, config_group_id):
++    device = scheduler._gpu_block_pool
++    host = BlockPool(
++        num_gpu_blocks=128,
++        enable_caching=True,
++        hash_block_size=scheduler._hash_block_size,
++    )
++    groups = [SimpleNamespace(block_pool=device) for _ in range(3)]
++    groups[config_group_id].block_pool = host
++    manager = object.__new__(KVCacheManager)
++    manager.block_pool = device
++    manager.coordinator = SimpleNamespace(single_type_managers=groups)
++    connector = object.__new__(MooncakeStoreConnector)
++    connector.connector_scheduler = scheduler
++    connector.bind_kv_cache_manager(manager)
++    return host
++
++
+ def _make_bare_scheduler(
+     *,
+     hash_block_size: int = 16,
+@@ -66,6 +93,7 @@ def _make_bare_scheduler(
+     scheduler._gpu_block_pool = BlockPool(
+         num_gpu_blocks=64, enable_caching=True, hash_block_size=hash_block_size
+     )
++    scheduler._kv_cache_manager = None
+     scheduler._num_workers = 1
+     scheduler._next_store_job_id = 0
+     scheduler._pinned_saves = {}
+@@ -1300,7 +1328,7 @@ def test_pending_partial_tail_emits_offload_only_reqmeta():
+     assert req_meta.num_prompt_tokens == 13
+     assert req_meta.block_ids == ([0],)
+     store_job_id = req_meta.store_job_id
+-    assert scheduler._pinned_saves[store_job_id][0] == [7]
++    assert _pinned_block_ids(scheduler, store_job_id) == [7]
+     assert scheduler._gpu_block_pool.blocks[0].ref_cnt == 0
+     assert scheduler._gpu_block_pool.blocks[7].ref_cnt == 1
+     tracker = scheduler._request_trackers["req-0"]
+@@ -1311,8 +1339,9 @@ def test_pending_partial_tail_emits_offload_only_reqmeta():
+ @pytest.mark.parametrize("attention_block_size", [4, 8, 16])
+ @pytest.mark.parametrize("use_eagle", [False, True])
+ @pytest.mark.parametrize("num_workers", [1, 2])
++@pytest.mark.parametrize("host_backed", [False, True])
+ def test_finished_partial_tail_is_pre_pinned_as_store_job(
+-    attention_block_size, use_eagle, num_workers
++    attention_block_size, use_eagle, num_workers, host_backed
+ ):
+     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+     scheduler._store_group_ids = (0, 1)
+@@ -1328,6 +1357,7 @@ def test_finished_partial_tail_is_pre_pinned_as_store_job(
+             dtype=torch.float32,
+         ),
+         is_eagle_group=use_eagle,
++        host_resident=host_backed,
+     )
+     scheduler._store_coord = MooncakeStoreCoordinator(
+         groups, 16, 4, use_eagle, enable_partial_hash_hits=True
+@@ -1350,9 +1380,11 @@ def test_finished_partial_tail_is_pre_pinned_as_store_job(
+         token_ids=list(range(prompt_tokens)),
+         prefill_end_tokens=prompt_tokens,
+     )
+-    pool = scheduler._gpu_block_pool
+-    owned_ids = attention_ids + [50]
+-    pool.touch([pool.blocks[i] for i in owned_ids])
++    device = scheduler._gpu_block_pool
++    attention = _bind_host_group(scheduler, 0) if host_backed else device
++    attention_blocks = [attention.blocks[i] for i in attention_ids]
++    attention.touch(attention_blocks)
++    device.touch([device.blocks[50]])
+ 
+     delay_free = scheduler.register_finished_partial_tail(
+         request,
+@@ -1368,11 +1400,12 @@ def test_finished_partial_tail_is_pre_pinned_as_store_job(
+         32 // attention_block_size : (proof_end + attention_block_size - 1)
+         // attention_block_size
+     ]
+-    pool.free_blocks([pool.blocks[i] for i in owned_ids])
++    attention.free_blocks(attention_blocks)
++    device.free_blocks([device.blocks[50]])
+     assert all(
+-        pool.blocks[i].ref_cnt == (1 if i in expected else 0) for i in attention_ids
++        attention.blocks[i].ref_cnt == (1 if i in expected else 0) for i in attention_ids
+     )
+-    assert pool.blocks[50].ref_cnt == 1
++    assert device.blocks[50].ref_cnt == 1
+ 
+     out = SimpleNamespace(
+         finished_req_ids={"req-0"},
+@@ -1402,17 +1435,20 @@ def test_finished_partial_tail_is_pre_pinned_as_store_job(
+             (proof_end + attention_block_size - 1) // attention_block_size,
+         )
+     ] + [(1, 50, 44)]
+-    assert set(scheduler._pinned_saves[req_meta.store_job_id][0]) == {50, *expected}
+-    assert all(pool.blocks[i].ref_cnt == 1 for i in expected + [50])
++    assert set(_pinned_block_ids(scheduler, req_meta.store_job_id)) == {50, *expected}
++    assert all(attention.blocks[i].ref_cnt == 1 for i in expected)
++    assert device.blocks[50].ref_cnt == 1
+     assert scheduler._finished_partial_tail_metas == {}
+ 
+     for _ in range(num_workers - 1):
+         scheduler.update_connector_output(
+             _make_worker_output({req_meta.store_job_id: 1})
+         )
+-        assert all(pool.blocks[i].ref_cnt == 1 for i in expected + [50])
++        assert all(attention.blocks[i].ref_cnt == 1 for i in expected)
++        assert device.blocks[50].ref_cnt == 1
+     scheduler.update_connector_output(_make_worker_output({req_meta.store_job_id: 1}))
+-    assert all(pool.blocks[i].ref_cnt == 0 for i in owned_ids)
++    assert all(block.ref_cnt == 0 for block in attention_blocks)
++    assert device.blocks[50].ref_cnt == 0
+ 
+ 
+ def test_partial_tail_boundary_follows_eagle_block_drop_not_group_flags():
+@@ -1676,7 +1712,7 @@ def test_resumed_prefill_claims_boundaries_past_prompt_length():
+     # Aligned states at 16 and 32 are inside the resumed prefill; 48 is past it.
+     assert meta.requests[0].boundary_puts == [(1, 7, 16), (1, 9, 32)]
+     store_job_id = meta.requests[0].store_job_id
+-    assert scheduler._pinned_saves[store_job_id][0] == [7, 9]
++    assert _pinned_block_ids(scheduler, store_job_id) == [7, 9]
+ 
+ 
+ def test_boundary_state_job_pins_exact_blocks_once():
+@@ -1696,7 +1732,7 @@ def test_boundary_state_job_pins_exact_blocks_once():
+         (1, 9, 48),
+     ]
+     store_job_id = req_meta.store_job_id
+-    assert scheduler._pinned_saves[store_job_id][0] == [7, 8, 9]
++    assert _pinned_block_ids(scheduler, store_job_id) == [7, 8, 9]
+     assert [scheduler._gpu_block_pool.blocks[i].ref_cnt for i in (7, 8, 9)] == [
+         1,
+         1,
+@@ -1755,7 +1791,7 @@ def test_store_job_pins_current_non_null_non_mamba_blocks():
+     req_meta = meta.requests[0]
+     assert req_meta.block_ids == current_block_ids
+     store_job_id = req_meta.store_job_id
+-    assert scheduler._pinned_saves[store_job_id][0] == [8, 7, 2, 6]
++    assert _pinned_block_ids(scheduler, store_job_id) == [8, 7, 2, 6]
+     assert pool.blocks[0].ref_cnt == 0
+     assert pool.blocks[5].ref_cnt == 0
+     assert [pool.blocks[i].ref_cnt for i in (21, 22, 23, 24, 25, 26)] == [
+@@ -1836,7 +1872,7 @@ def test_decode_consumer_claims_only_decode_boundary_state():
+ 
+     assert meta.requests[0].boundary_puts == [(1, 9, 16)]
+     store_job_id = meta.requests[0].store_job_id
+-    assert scheduler._pinned_saves[store_job_id][0] == [9]
++    assert _pinned_block_ids(scheduler, store_job_id) == [9]
+ 
+ 
+ def test_resumed_partial_tail_uses_exact_boundary():
+@@ -1918,7 +1954,7 @@ def test_partial_tail_cow_block_is_referenced_for_the_job():
+     store_job_id = meta.requests[0].store_job_id
+     # It leads the list, as in `pop_blocks_for_free`, so that the reversed free
+     # puts it last in eviction priority.
+-    assert scheduler._pinned_saves[store_job_id][0] == [7]
++    assert _pinned_block_ids(scheduler, store_job_id) == [7]
+     assert pool.blocks[0].ref_cnt == 0
+     assert pool.blocks[7].ref_cnt == 1
+ 
+@@ -1965,3 +2001,77 @@ def test_worker_metadata_aggregates_completions_across_ranks():
+         MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
+     )
+     assert merged.completed_saves == {1: 2, 2: 1}
++
++
++@pytest.mark.parametrize("finished_lookahead", [False, True])
++def test_store_job_pins_distinct_blocks_with_matching_ids(finished_lookahead):
++    scheduler = _make_bare_scheduler(hash_block_size=4)
++    scheduler._num_workers = 2
++    # Store uses compact group indices. The live cache manager keeps the
++    # group IDs from the complete configuration, including skipped groups.
++    scheduler._store_group_ids = (1, 2)
++    scheduler._boundary_state_group_ids = frozenset()
++    spec = scheduler._store_coord.kv_cache_groups[0]
++    scheduler._store_coord = MooncakeStoreCoordinator(
++        [replace(spec, host_resident=True), spec],
++        16,
++        4,
++        use_eagle=False,
++        num_hash_lookahead_tokens=int(finished_lookahead),
++    )
++    device = scheduler._gpu_block_pool
++    host = _bind_host_group(scheduler, 1)
++    # The same numeric ID exists in both pools. The second CPU block does
++    # not have a matching device ID at all.
++    block_ids = ([7, 70, 7], [7])
++    hashes = [bytes([i]) for i in range(12)]
++    if finished_lookahead:
++        request = SimpleNamespace(
++            request_id="req-0",
++            num_computed_tokens=48,
++            num_in_flight_tokens=0,
++            num_stale_output_tokens=0,
++            num_prompt_tokens=48,
++            num_tokens=48,
++            all_token_ids=list(range(48)),
++            block_hashes=hashes,
++        )
++        scheduler._request_trackers["req-0"] = RequestTracker(
++            req_id="req-0",
++            token_len=48,
++            allocated_block_ids=block_ids,
++            token_ids=list(range(48)),
++            prefill_end_tokens=48,
++        )
++        scheduler.register_finished_lookahead_save(request, ([], *block_ids))
++        req_meta = scheduler._finished_lookahead_metas["req-0"]
++    else:
++        req_meta = ReqMeta("req-0", 48, block_ids, hashes, can_save=True)
++        scheduler._reference_save_blocks([req_meta])
++
++    job_id = req_meta.store_job_id
++    assert scheduler._pinned_saves[job_id] == (
++        {host: [host.blocks[7], host.blocks[70]], device: [device.blocks[7]]},
++        2,
++    )
++    blocks = [host.blocks[7], host.blocks[70], device.blocks[7]]
++    assert [block.ref_cnt for block in blocks] == [1, 1, 1]
++    scheduler.update_connector_output(_make_worker_output({job_id: 1}))
++    assert [block.ref_cnt for block in blocks] == [1, 1, 1]
++    scheduler.update_connector_output(_make_worker_output({job_id: 1}))
++    assert [block.ref_cnt for block in blocks] == [0, 0, 0]
++
++
++def test_store_job_does_not_pin_anything_when_host_pool_is_unavailable():
++    scheduler = _make_bare_scheduler()
++    spec = scheduler._store_coord.kv_cache_groups[0]
++    scheduler._store_coord = MooncakeStoreCoordinator(
++        [spec, replace(spec, host_resident=True)], 16, 16, use_eagle=False
++    )
++    scheduler._boundary_state_group_ids = frozenset()
++    req_meta = ReqMeta("req-0", 16, ([7], [7]), [b"h"], can_save=True)
++    with pytest.raises(RuntimeError, match="no host cache manager"):
++        scheduler._reference_save_blocks([req_meta])
++    assert req_meta.store_job_id is None
++    assert scheduler._pinned_saves == {}
++    assert scheduler._gpu_block_pool.blocks[7].ref_cnt == 0
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+index a45f5d38..749815da 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+@@ -45,7 +45,7 @@ from vllm.forward_context import ForwardContext
+ from vllm.logger import init_logger
+ from vllm.v1.attention.backend import AttentionMetadata
+ from vllm.v1.core.block_pool import BlockPool
+-from vllm.v1.core.kv_cache_manager import KVCacheBlocks
++from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.outputs import KVConnectorOutput
+@@ -269,6 +269,11 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+             request, blocks, num_external_tokens
+         )
+ 
++    def bind_kv_cache_manager(self, kv_cache_manager: KVCacheManager) -> None:
++        super().bind_kv_cache_manager(kv_cache_manager)
++        assert self.connector_scheduler is not None
++        self.connector_scheduler.bind_kv_cache_manager(kv_cache_manager)
++
+     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+         assert self.connector_scheduler is not None
+         self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+index 78b2b819..0da6b708 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+@@ -5,7 +5,7 @@
+ # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
+ """Scheduler-side logic for MooncakeStoreConnector."""
+ 
+-from collections.abc import Sequence
++from collections.abc import Iterable, Sequence
+ 
+ from vllm.config import VllmConfig
+ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+@@ -29,8 +29,9 @@ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+ from vllm.v1.core.block_pool import BlockPool
+-from vllm.v1.core.kv_cache_manager import KVCacheBlocks
++from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.kv_cache_utils import (
++    KVCacheBlock,
+     resolve_kv_cache_block_sizes,
+ )
+ from vllm.v1.core.sched.output import SchedulerOutput
+@@ -188,10 +189,13 @@ class MooncakeStoreScheduler:
+             self.enable_partial_hash_hits = self._store_coord.enable_partial_hash_hits
+ 
+         self._gpu_block_pool: BlockPool | None = None
++        self._kv_cache_manager: KVCacheManager | None = None
+         self._num_workers = vllm_config.parallel_config.world_size
+         self._next_store_job_id = 0
+-        # store_job_id -> (referenced block ids, ranks yet to report completion)
+-        self._pinned_saves: dict[int, tuple[list[int], int]] = {}
++        # store_job_id -> (owned blocks by pool, ranks yet to report completion)
++        self._pinned_saves: dict[
++            int, tuple[dict[BlockPool, list[KVCacheBlock]], int]
++        ] = {}
+ 
+         # Per-request state
+         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
+@@ -202,6 +206,9 @@ class MooncakeStoreScheduler:
+         self._finished_partial_tail_metas: dict[str, ReqMeta] = {}
+         self._finished_lookahead_metas: dict[str, ReqMeta] = {}
+ 
++    def bind_kv_cache_manager(self, kv_cache_manager: KVCacheManager) -> None:
++        self._kv_cache_manager = kv_cache_manager
++
+     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+         self._gpu_block_pool = gpu_block_pool
+ 
+@@ -528,22 +535,13 @@ class MooncakeStoreScheduler:
+             )
+ 
+     def _reference_save_blocks(self, requests: list[ReqMeta]) -> None:
+-        """Take a GPU block reference for every store job this step emits.
+-
+-        The worker DMAs out of these blocks after the step that scheduled them,
+-        so a reference keeps them out of the free queue even once the request
+-        itself is freed, until every rank reports the job done.
+-        """
+-        pool = self._gpu_block_pool
++        """Retain each store job's sources until every rank reports it done."""
+         coord = self._store_coord
+         assert coord is not None
+         block_sizes = [g.kv_cache_spec.block_size for g in coord.kv_cache_groups]
+         for req_meta in requests:
+             if not req_meta.can_save:
+                 continue
+-            assert pool is not None, (
+-                "GPU block pool must be bound before any store job is emitted"
+-            )
+             if req_meta.store_job_id is not None:
+                 assert req_meta.store_job_id in self._pinned_saves
+                 continue
+@@ -558,29 +556,58 @@ class MooncakeStoreScheduler:
+                         + coord.num_hash_lookahead_tokens
+                     ]
+                 )
+-            req_meta.store_job_id = store_job_id = self._next_store_job_id
+-            self._next_store_job_id += 1
+-            block_ids = [put.block_id for put in req_meta.boundary_puts or []]
+-            assert NULL_BLOCK_ID not in block_ids, (
+-                "A null block cannot back a boundary put"
+-            )
++            block_refs = [
++                (put.group_id, put.block_id) for put in req_meta.boundary_puts or []
++            ]
+             if req_meta.token_len_chunk:
+                 # Each rank may retry from an earlier successful save offset.
+-                block_ids.extend(
+-                    block_id
++                block_refs.extend(
++                    (group_id, block_id)
+                     for group_id, group in enumerate(req_meta.block_ids)
+                     if group_id not in self._boundary_state_group_ids
+                     for block_id in group
+                     if block_id != NULL_BLOCK_ID
+                 )
+-            # An aligned boundary block may also be present in the request's
+-            # block table. Take and release exactly one reference per block.
+-            block_ids = list(dict.fromkeys(block_ids))
+-            assert NULL_BLOCK_ID not in block_ids
+-            if not block_ids:
+-                continue
+-            self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
+-            pool.touch([pool.blocks[block_id] for block_id in block_ids])
++            self._pin_save(req_meta, block_refs)
++
++    def _pin_save(
++        self, req_meta: ReqMeta, block_refs: Iterable[tuple[int, int]]
++    ) -> None:
++        coord = self._store_coord
++        gpu_pool = self._gpu_block_pool
++        assert coord is not None and gpu_pool is not None
++        group_pools: dict[int, BlockPool] = {}
++        ids_by_pool: dict[BlockPool, dict[int, None]] = {}
++        for group_id, block_id in block_refs:
++            assert block_id != NULL_BLOCK_ID, "A null block cannot back a store job"
++            pool = group_pools.get(group_id)
++            if pool is None:
++                pool = gpu_pool
++                if coord.kv_cache_groups[group_id].host_resident:
++                    manager = self._kv_cache_manager
++                    if manager is None:
++                        raise RuntimeError("Mooncake Store has no host cache manager")
++                    pool = manager.get_group_block_pool(self._store_group_ids[group_id])
++                    if pool is gpu_pool:
++                        raise RuntimeError("Mooncake Store host pool is not bound")
++                group_pools[group_id] = pool
++            if not 0 < block_id < len(pool.blocks):
++                raise ValueError(f"Mooncake Store block ID {block_id} is out of range")
++            ids_by_pool.setdefault(pool, {})[block_id] = None
++
++        # Resolve all IDs before taking any references. IDs can overlap across
++        # pools, but a physical block needs at most one reference per job.
++        blocks_by_pool = {
++            pool: [pool.blocks[block_id] for block_id in ids]
++            for pool, ids in ids_by_pool.items()
++        }
++        req_meta.store_job_id = store_job_id = self._next_store_job_id
++        self._next_store_job_id += 1
++        if not blocks_by_pool:
++            return
++        for pool, blocks in blocks_by_pool.items():
++            pool.touch(blocks)
++        self._pinned_saves[store_job_id] = (blocks_by_pool, self._num_workers)
+ 
+     def register_finished_lookahead_save(
+         self,
+@@ -676,21 +703,10 @@ class MooncakeStoreScheduler:
+             ),
+             *mamba_puts,
+         ]
+-        pinned_block_ids = list(
+-            dict.fromkeys(put.block_id for put in req_meta.boundary_puts)
+-        )
+-
+-        pool = self._gpu_block_pool
+-        assert pool is not None, (
+-            "GPU block pool must be bound before a finish-time handoff"
+-        )
+         assert request.request_id not in self._finished_partial_tail_metas
+-        store_job_id = self._next_store_job_id
+-        self._next_store_job_id += 1
+-        self._pinned_saves[store_job_id] = (pinned_block_ids, self._num_workers)
+-        pool.touch([pool.blocks[block_id] for block_id in pinned_block_ids])
+-
+-        req_meta.store_job_id = store_job_id
++        self._pin_save(
++            req_meta, ((put.group_id, put.block_id) for put in req_meta.boundary_puts)
++        )
+         self._finished_partial_tail_metas[request.request_id] = req_meta
+         tracker.has_pending_offload = True
+         # The store job owns exact block refs, so request cleanup need not wait.
+@@ -756,24 +772,23 @@ class MooncakeStoreScheduler:
+         meta = connector_output.kv_connector_worker_meta
+         if not isinstance(meta, MooncakeStoreWorkerMetadata):
+             return
+-        pool = self._gpu_block_pool
+-        assert pool is not None
+         for store_job_id, count in meta.completed_saves.items():
+             pinned = self._pinned_saves.get(store_job_id)
+             if pinned is None:
+                 # The job referenced no blocks, so nothing was recorded for it.
+                 continue
+-            block_ids, remaining = pinned
++            blocks_by_pool, remaining = pinned
+             remaining -= count
+             if remaining > 0:
+-                self._pinned_saves[store_job_id] = (block_ids, remaining)
++                self._pinned_saves[store_job_id] = (blocks_by_pool, remaining)
+                 continue
+             assert remaining == 0, (
+                 f"store job {store_job_id} reported by too many ranks"
+             )
+             del self._pinned_saves[store_job_id]
+-            # Tail-first, as elsewhere, so the shared prefix is evicted last.
+-            pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))
++            for pool, blocks in blocks_by_pool.items():
++                # Tail-first, as elsewhere, so the shared prefix is evicted last.
++                pool.free_blocks(reversed(blocks))
+ 
+     def has_pending_push_work(self) -> bool:
+         """Keep the engine stepping while any store job still holds block refs.
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 44e14484..653e28dd 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -9,6 +9,7 @@ from typing import Literal, overload
+ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
++from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_coordinator import (
+     HybridKVCacheCoordinator,
+     get_kv_cache_coordinator,
+@@ -753,6 +754,10 @@ class KVCacheManager:
+         """Get the block ids of a request."""
+         return self.get_blocks(request_id).get_block_ids()
+ 
++    def get_group_block_pool(self, group_id: int) -> BlockPool:
++        """Return the physical pool that owns this group's block IDs."""
++        return self.coordinator.single_type_managers[group_id].block_pool
++
+     def get_block_ids_for_computed_tokens(
+         self,
+         request_id: str,

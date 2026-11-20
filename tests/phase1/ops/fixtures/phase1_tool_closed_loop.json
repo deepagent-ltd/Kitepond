@@ -1,0 +1,85 @@
+{
+  "case_id": "p3-tool-closed-loop",
+  "oracle": {
+    "expected_calls": [
+      {
+        "arguments": {
+          "item": {
+            "sku": "铜-甲"
+          }
+        },
+        "name": "lookup_item"
+      }
+    ],
+    "expected_final": {
+      "expected": {
+        "currency": "CNY",
+        "quantity": 3,
+        "sku": "铜-甲",
+        "total": 21
+      },
+      "kind": "json"
+    },
+    "expected_tool_count": 1,
+    "kind": "tool_loop",
+    "max_model_steps": 3,
+    "stub": {
+      "lookup_item": {
+        "arguments": {
+          "item": {
+            "sku": "铜-甲"
+          }
+        },
+        "result": {
+          "available": 4,
+          "currency": "CNY",
+          "sku": "铜-甲",
+          "unit_price": 7
+        }
+      }
+    }
+  },
+  "request": {
+    "messages": [
+      {
+        "content": "Use the provided lookup_item test tool exactly once to obtain the price. After its result, return only the requested JSON. Do not invent a price.",
+        "role": "system"
+      },
+      {
+        "content": "Look up item with nested argument item.sku=铜-甲. Buy quantity 3. After the tool result, return JSON with exactly sku, quantity, total, currency. Compute total as unit_price times quantity.",
+        "role": "user"
+      }
+    ],
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "function": {
+          "description": "Read one item from a deterministic local test inventory; no external action.",
+          "name": "lookup_item",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "item": {
+                "additionalProperties": false,
+                "properties": {
+                  "sku": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "sku"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "item"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ]
+  }
+}
