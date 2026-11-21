@@ -192,8 +192,11 @@ def _prepare_serve(args: argparse.Namespace) -> None:
     # Match ServeSubcommand.cmd before EngineArgs is built for device selection.
     args.model = args.model_tag or args.model
     model = inspect_checkpoint(Path(args.model))
-    if model.kind != CheckpointKind.FLASH_NVFP4:
-        raise ValueError("this wheel supports GLM-5.3-Flash NVFP4")
+    if model.kind == CheckpointKind.FLASH_FP8:
+        if mode != (8, 1, 1):
+            raise ValueError("GLM-5.3-Flash FP8 requires TP8 with DP1 and DCP1")
+    elif model.kind != CheckpointKind.FLASH_NVFP4:
+        raise ValueError("supported checkpoints are GLM-5.3-Flash NVFP4 and FP8")
     attention = args.attention_config
     backend = attention.backend_per_kind.get("mla_attention")
     if backend is None:
