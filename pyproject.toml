@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kitepond"
-version = "0.1.0"
+version = "0.2.0"
 description = "Kitepond cache integration tools"
 requires-python = ">=3.12"
 license = {file = "LICENSE"}

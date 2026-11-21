@@ -84,7 +84,7 @@ GLM-5.3-Flash NVFP4 权重。表中各构型均在 GPU 显存利用率 90%、上
 从 v0.2.0 起可在对应的 [GitHub Release](https://github.com/deepagent-ltd/Kitepond/releases)
 下载 WHL 和 `SHA256SUMS`。
 
-在 GPU 宿主机上准备 `kitepond-0.1.0-py3-none-any.whl` 和完整的模型权重。
+在 GPU 宿主机上准备 `kitepond-0.2.0-py3-none-any.whl` 和完整的模型权重。
 替换示例中的两个本地路径后启动容器。
 
 ```bash
@@ -106,7 +106,7 @@ CUDA 扩展。张量并行、数据并行、专家并行和解码上下文并行
 
 ```bash
 uv pip install --system --offline --no-index --no-deps \
-  /artifacts/kitepond-0.1.0-py3-none-any.whl
+  /artifacts/kitepond-0.2.0-py3-none-any.whl
 kitepond serve --enable --help=all
 ```
 

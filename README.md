@@ -101,7 +101,7 @@ GPUs, and P/D deployment require separate qualification.
 From v0.2.0 onward, download the WHL and `SHA256SUMS` from the matching
 [GitHub Release](https://github.com/deepagent-ltd/Kitepond/releases).
 
-Have `kitepond-0.1.0-py3-none-any.whl` and the complete model checkpoint on
+Have `kitepond-0.2.0-py3-none-any.whl` and the complete model checkpoint on
 the GPU host. Set the two paths in this example and start the container.
 
 ```bash
@@ -126,7 +126,7 @@ topology and reports conflicting configuration values as startup errors.
 
 ```bash
 uv pip install --system --offline --no-index --no-deps \
-  /artifacts/kitepond-0.1.0-py3-none-any.whl
+  /artifacts/kitepond-0.2.0-py3-none-any.whl
 kitepond serve --enable --help=all
 ```
 
