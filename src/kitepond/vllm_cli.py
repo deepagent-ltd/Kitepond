@@ -115,6 +115,43 @@ def _configure_host_pool(args: argparse.Namespace, dp: bool, dcp: int, runtime: 
     args.kv_transfer_config = replace(transfer, kv_connector_extra_config=options)
 
 
+def _configure_dcp8_speculation(args: argparse.Namespace) -> None:
+    if any(
+        option is not None
+        for option in (args.spec_method, args.spec_model, args.spec_tokens)
+    ):
+        raise ValueError("DCP8 MTP3 requires --speculative-config")
+    requested = args.speculative_config
+    if requested is None:
+        return
+
+    mtp3 = {
+        "method": "mtp",
+        "num_speculative_tokens": 3,
+        "draft_tensor_parallel_size": 8,
+        "draft_decode_context_parallel_size": 8,
+    }
+    if (
+        not isinstance(requested, dict)
+        or requested.get("method") != "mtp"
+        or requested.get("num_speculative_tokens") != 3
+        or any(
+            name not in mtp3
+            or type(value) is not type(mtp3[name])
+            or value != mtp3[name]
+            for name, value in requested.items()
+        )
+    ):
+        raise ValueError(
+            'DCP8 supports native MTP3 via --speculative-config '
+            '{"method":"mtp","num_speculative_tokens":3} with draft TP8/DCP8'
+        )
+    args.speculative_config = mtp3
+    args.attention_config = replace(
+        args.attention_config, enable_glm_flash_dcp8_mtp3=True
+    )
+
+
 def _prepare_serve(args: argparse.Namespace) -> None:
     from vllm.config.attention import AttentionConfig, HiSparseConfig
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -140,8 +177,7 @@ def _prepare_serve(args: argparse.Namespace) -> None:
     _require(args, enable_expert_parallel=True, data_parallel_size_local=dp)
     _require(args, kv_cache_dtype="fp8_ds_mla" if dcp == 8 else "fp8")
     if dcp == 8:
-        if args.speculative_config or args.spec_method or args.spec_model:
-            raise ValueError("Kitepond's DCP8 profile requires speculative decoding to be disabled")
+        _configure_dcp8_speculation(args)
         _require(
             args,
             block_size=256,

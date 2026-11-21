@@ -22,7 +22,7 @@ def main() -> None:
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--sources", type=Path, required=True)
     cli.add_argument("--output", type=Path, required=True)
-    cli.add_argument("--target", required=True, help="Commit that provided the overlay sources")
+    cli.add_argument("--target", required=True, help="Git revision of the overlay or patch set")
     args = cli.parse_args()
     names = ("vllm", "torch", "flashinfer-python")
     versions = {name: importlib.metadata.version(name) for name in names}

@@ -167,6 +167,27 @@ curl -fsS http://127.0.0.1:8000/v1/completions \
 给脚本传入容器内的模型路径和 policy JSON 路径。policy 文件所在目录须可写，
 工作进程会在其旁边创建租约锁文件。
 
+### 在 TP8 + DCP8 上启用 MTP3
+
+DCP8 脚本默认使用 MTP0。使用 GLM-5.3-Flash NVFP4 时，可设置
+`KITEPOND_DCP8_MTP=3` 启用模型自带的 MTP 层。此配置使用 16 GiB HiSparse
+主存池和 92% 的 GPU 显存利用率。用以下命令创建可写的 policy 目录并启动。
+
+```bash
+policy_dir=$(mktemp -d)
+printf '%s\n' '{"rank_bytes":2147483648,"total_bytes":17179869184}' > "$policy_dir/policy.json"
+KITEPOND_DCP8_MTP=3 bash examples/serve_glm53_flash_nvfp4_dcp8.sh \
+  /models/GLM-5.3-FLASH-NVFP4 "$policy_dir/policy.json"
+```
+
+自定义 DCP8 启动命令可加上
+`--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`。
+Kitepond 会设置 draft TP8 和 draft DCP8。源块大小仍为 256，索引块大小为 2048，
+图模式为 `FULL_AND_PIECEWISE`。此选项的上限为 131,072 个上下文 token、
+16 条序列和 2,048 个批处理 token。上文公布的容量数字使用 MTP0。
+
+### TP8 + DCP1
+
 使用 TP8 + DCP1 时，在启动容器时设置 `--shm-size 416g` 供原生共享池使用。
 在上面的 DP8 命令中，把 tensor parallel size 改为 8，两个 data parallel size 都改为 1，
 decode context parallel size 保持为 1。设置
@@ -186,12 +207,13 @@ git clone --depth 1 --branch v0.34.0 https://github.com/vllm-project/vllm.git ..
 test "$(git -C ../vllm-v034 rev-parse HEAD)" = 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
 bash tools/stage_v034_runtime.sh ../vllm-v034 ./runtime-sources
 mkdir -p dist
+KITEPOND_REVISION=$(git rev-parse HEAD)
 
 docker run --rm -i --platform linux/amd64 --runtime runc --network none \
   -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES= \
   --mount "type=bind,source=$PWD,target=/src,readonly" \
   --mount "type=bind,source=$PWD/dist,target=/artifacts" \
-  --entrypoint /bin/bash "$VLLM_IMAGE" -se <<'BUILD'
+  --entrypoint /bin/bash "$VLLM_IMAGE" -se -- "$KITEPOND_REVISION" <<'BUILD'
 uv venv --offline --system-site-packages --python /usr/bin/python3 /tmp/kitepond-build
 python_bin=/tmp/kitepond-build/bin/python
 mkdir /tmp/build
@@ -201,7 +223,7 @@ cd /tmp/build
 
 "$python_bin" tools/seal_v034_runtime.py \
   --sources ./runtime-sources --output src/kitepond/v034-runtime.zip \
-  --target 29ec998892e24f6372c291bd2ac1c45f76727808
+  --target "$1"
 "$python_bin" -c 'from setuptools.build_meta import build_sdist; build_sdist("/artifacts")'
 mkdir /tmp/sdist
 tar -xzf /artifacts/kitepond-0.1.0.tar.gz -C /tmp/sdist
@@ -215,8 +237,8 @@ BUILD
 
 ## vLLM 兼容补丁
 
-源码构建时将 `compat/vllm-v034/` 下的七份补丁应用到 vLLM 0.34.0，并把生成的 Python
-文件打入 WHL。补丁涉及 HiSparse 主存租约、SM120 DCP8、调度器与工作进程生命周期、
+源码构建时将 `compat/vllm-v034/` 下的补丁应用到 vLLM 0.34.0，并把生成的 Python
+文件打入 WHL。补丁涉及 HiSparse 主存租约、SM120 DCP8 和原生 MTP3、调度器与工作进程生命周期、
 Mooncake 交接和主存页保留。`kitepond serve` 带 `--enable` 启动时校验固定的官方 vLLM 镜像，
 只为该服务进程加载兼容文件。这是上游接口合入前的过渡方案。我们希望尽快将所需接口合入
 vLLM 主线，让用户能用 vLLM 原生命令启用 Kitepond。请从上文验证过的模型与构型中选择启动配置。

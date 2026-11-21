@@ -190,6 +190,30 @@ an installed wheel. Pass the in-container model path and policy JSON path to
 either script. Use a writable directory for the policy so workers can create
 lease locks next to it.
 
+### Opt in to MTP3 on TP8 + DCP8
+
+The DCP8 script defaults to MTP0. On the GLM-5.3-Flash NVFP4 profile,
+set `KITEPOND_DCP8_MTP=3` to use the checkpoint's native MTP layer.
+The script uses a 16 GiB HiSparse host pool and 92% GPU memory utilization
+for this profile. Create a writable policy directory and run the exact
+profile with the following commands.
+
+```bash
+policy_dir=$(mktemp -d)
+printf '%s\n' '{"rank_bytes":2147483648,"total_bytes":17179869184}' > "$policy_dir/policy.json"
+KITEPOND_DCP8_MTP=3 bash examples/serve_glm53_flash_nvfp4_dcp8.sh \
+  /models/GLM-5.3-FLASH-NVFP4 "$policy_dir/policy.json"
+```
+
+For a custom DCP8 command, pass
+`--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`.
+Kitepond supplies draft TP8 and draft DCP8. Keep source blocks at 256,
+indexer blocks at 2048, and graph mode at `FULL_AND_PIECEWISE`.
+This opt-in is limited to 131,072 context tokens, 16 sequences, and 2,048
+batched tokens. The capacity figures above use MTP0.
+
+### TP8 + DCP1
+
 For TP8 + DCP1, start the container with `--shm-size 416g` for the native
 shared pool. In the inline DP8 command, set tensor parallel size to 8 and
 both data parallel sizes to 1. Keep decode context parallel size at 1.
@@ -210,12 +234,13 @@ git clone --depth 1 --branch v0.34.0 https://github.com/vllm-project/vllm.git ..
 test "$(git -C ../vllm-v034 rev-parse HEAD)" = 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
 bash tools/stage_v034_runtime.sh ../vllm-v034 ./runtime-sources
 mkdir -p dist
+KITEPOND_REVISION=$(git rev-parse HEAD)
 
 docker run --rm -i --platform linux/amd64 --runtime runc --network none \
   -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES= \
   --mount "type=bind,source=$PWD,target=/src,readonly" \
   --mount "type=bind,source=$PWD/dist,target=/artifacts" \
-  --entrypoint /bin/bash "$VLLM_IMAGE" -se <<'BUILD'
+  --entrypoint /bin/bash "$VLLM_IMAGE" -se -- "$KITEPOND_REVISION" <<'BUILD'
 uv venv --offline --system-site-packages --python /usr/bin/python3 /tmp/kitepond-build
 python_bin=/tmp/kitepond-build/bin/python
 mkdir /tmp/build
@@ -225,7 +250,7 @@ cd /tmp/build
 
 "$python_bin" tools/seal_v034_runtime.py \
   --sources ./runtime-sources --output src/kitepond/v034-runtime.zip \
-  --target 29ec998892e24f6372c291bd2ac1c45f76727808
+  --target "$1"
 "$python_bin" -c 'from setuptools.build_meta import build_sdist; build_sdist("/artifacts")'
 mkdir /tmp/sdist
 tar -xzf /artifacts/kitepond-0.1.0.tar.gz -C /tmp/sdist
@@ -239,10 +264,10 @@ instructions above. The source archive is `dist/kitepond-0.1.0.tar.gz`.
 
 ## vLLM compatibility patches
 
-The source build applies the seven patches in `compat/vllm-v034/` to vLLM
+The source build applies the patches in `compat/vllm-v034/` to vLLM
 0.34.0 and packages the resulting Python files inside the wheel. They cover
-HiSparse host memory leases and SM120 DCP8, scheduler and worker lifecycle,
-and Mooncake handoff and host-page retention. The wheel checks the pinned
+HiSparse host memory leases, SM120 DCP8 and native MTP3, scheduler and worker
+lifecycle, and Mooncake handoff and host-page retention. The wheel checks the pinned
 official vLLM image when `kitepond serve` is invoked with `--enable` and loads
 the compatibility files for that server process. This is the installation path
 until the required extension interfaces land upstream. We aim to bring this
