@@ -81,6 +81,9 @@ GLM-5.3-Flash NVFP4 权重。表中各构型均在 GPU 显存利用率 90%、上
 
 ## 安装和运行 WHL
 
+从 v0.2.0 起可在对应的 [GitHub Release](https://github.com/deepagent-ltd/Kitepond/releases)
+下载 WHL 和 `SHA256SUMS`。
+
 在 GPU 宿主机上准备 `kitepond-0.1.0-py3-none-any.whl` 和完整的模型权重。
 替换示例中的两个本地路径后启动容器。
 
@@ -197,43 +200,23 @@ decode context parallel size 保持为 1。设置
 
 ## 从源码构建 WHL
 
-在安装了 Git 和 Docker 的 Linux 宿主机上，从干净的 Kitepond 源码目录执行以下命令。
-构建使用与 WHL 安装相同的 vLLM 镜像和固定版本的上游 Git 源码，可在无 GPU 的机器上运行。
+在安装了 Git 和 Python 3.12 的 Linux 宿主机上，从干净的 Kitepond 源码目录执行以下命令。
+构建读取当前 Git 提交和固定版本的 vLLM 源码，并使用从上文官方镜像采集的兼容性指纹。
+构建过程无需 Docker 或 GPU。
 
 ```bash
-VLLM_IMAGE=vllm/vllm-openai@sha256:cf5b2fdd087eb4f6d261736967cc5cde974bd22ff4df50365f8fa419b6b4c484
-
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install setuptools==80.9.0
 git clone --depth 1 --branch v0.34.0 https://github.com/vllm-project/vllm.git ../vllm-v034
 test "$(git -C ../vllm-v034 rev-parse HEAD)" = 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
-bash tools/stage_v034_runtime.sh ../vllm-v034 ./runtime-sources
-mkdir -p dist
-KITEPOND_REVISION=$(git rev-parse HEAD)
-
-docker run --rm -i --platform linux/amd64 --runtime runc --network none \
-  -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES= \
-  --mount "type=bind,source=$PWD,target=/src,readonly" \
-  --mount "type=bind,source=$PWD/dist,target=/artifacts" \
-  --entrypoint /bin/bash "$VLLM_IMAGE" -se -- "$KITEPOND_REVISION" <<'BUILD'
-uv venv --offline --system-site-packages --python /usr/bin/python3 /tmp/kitepond-build
-python_bin=/tmp/kitepond-build/bin/python
-mkdir /tmp/build
-tar -C /src --exclude='./.git' --exclude='./.venv' --exclude='./dist' --exclude='./docs' -cf - . |
-  tar -xf - -C /tmp/build
-cd /tmp/build
-
-"$python_bin" tools/seal_v034_runtime.py \
-  --sources ./runtime-sources --output src/kitepond/v034-runtime.zip \
-  --target "$1"
-"$python_bin" -c 'from setuptools.build_meta import build_sdist; build_sdist("/artifacts")'
-mkdir /tmp/sdist
-tar -xzf /artifacts/kitepond-0.1.0.tar.gz -C /tmp/sdist
-cd /tmp/sdist/kitepond-0.1.0
-"$python_bin" -c 'from setuptools.build_meta import build_wheel; build_wheel("/artifacts")'
-BUILD
+bash tools/build_release.sh ../vllm-v034 dist
+(cd dist && sha256sum --check SHA256SUMS)
 ```
 
-按上文步骤安装生成的 `dist/kitepond-0.1.0-py3-none-any.whl`。
-源码包位于 `dist/kitepond-0.1.0.tar.gz`。
+发布流程从 Release tag 构建，tag 必须与 `pyproject.toml` 中的版本对应，格式为
+`v<版本号>`。发布后，GitHub Actions 会把 WHL、源码包和校验文件附到对应 Release。
+手动运行该工作流时，可在该次运行的 Artifacts 中下载相同产物。
 
 ## vLLM 兼容补丁
 

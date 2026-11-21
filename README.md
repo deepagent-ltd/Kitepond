@@ -98,6 +98,9 @@ GPUs, and P/D deployment require separate qualification.
 
 ## Install and run the wheel
 
+From v0.2.0 onward, download the WHL and `SHA256SUMS` from the matching
+[GitHub Release](https://github.com/deepagent-ltd/Kitepond/releases).
+
 Have `kitepond-0.1.0-py3-none-any.whl` and the complete model checkpoint on
 the GPU host. Set the two paths in this example and start the container.
 
@@ -223,44 +226,25 @@ This profile uses the native shared pool and needs no external lease policy.
 
 ## Build the wheel from source
 
-Run from a clean Kitepond checkout on a Linux host with Git and Docker.
-The build uses the same vLLM image as the wheel installation. It needs
-the pinned upstream Git source and can run without a GPU.
+Run from a clean Kitepond checkout on a Linux host with Git and Python 3.12.
+The builder packages the current Git commit with the pinned vLLM source and
+uses stock compatibility fingerprints captured from the official image listed
+above. Building the wheel does not need Docker or a GPU.
 
 ```bash
-VLLM_IMAGE=vllm/vllm-openai@sha256:cf5b2fdd087eb4f6d261736967cc5cde974bd22ff4df50365f8fa419b6b4c484
-
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install setuptools==80.9.0
 git clone --depth 1 --branch v0.34.0 https://github.com/vllm-project/vllm.git ../vllm-v034
 test "$(git -C ../vllm-v034 rev-parse HEAD)" = 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
-bash tools/stage_v034_runtime.sh ../vllm-v034 ./runtime-sources
-mkdir -p dist
-KITEPOND_REVISION=$(git rev-parse HEAD)
-
-docker run --rm -i --platform linux/amd64 --runtime runc --network none \
-  -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES= \
-  --mount "type=bind,source=$PWD,target=/src,readonly" \
-  --mount "type=bind,source=$PWD/dist,target=/artifacts" \
-  --entrypoint /bin/bash "$VLLM_IMAGE" -se -- "$KITEPOND_REVISION" <<'BUILD'
-uv venv --offline --system-site-packages --python /usr/bin/python3 /tmp/kitepond-build
-python_bin=/tmp/kitepond-build/bin/python
-mkdir /tmp/build
-tar -C /src --exclude='./.git' --exclude='./.venv' --exclude='./dist' --exclude='./docs' -cf - . |
-  tar -xf - -C /tmp/build
-cd /tmp/build
-
-"$python_bin" tools/seal_v034_runtime.py \
-  --sources ./runtime-sources --output src/kitepond/v034-runtime.zip \
-  --target "$1"
-"$python_bin" -c 'from setuptools.build_meta import build_sdist; build_sdist("/artifacts")'
-mkdir /tmp/sdist
-tar -xzf /artifacts/kitepond-0.1.0.tar.gz -C /tmp/sdist
-cd /tmp/sdist/kitepond-0.1.0
-"$python_bin" -c 'from setuptools.build_meta import build_wheel; build_wheel("/artifacts")'
-BUILD
+bash tools/build_release.sh ../vllm-v034 dist
+(cd dist && sha256sum --check SHA256SUMS)
 ```
 
-Install the resulting `dist/kitepond-0.1.0-py3-none-any.whl` using the wheel
-instructions above. The source archive is `dist/kitepond-0.1.0.tar.gz`.
+The release workflow builds from the release tag. The tag must be `v`
+followed by the package version in `pyproject.toml`. Publishing the release
+attaches the wheel, source archive and checksums. A manual Actions run builds
+the same files and stores them in the run's artifacts.
 
 ## vLLM compatibility patches
 
