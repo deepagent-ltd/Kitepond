@@ -215,8 +215,10 @@ bash tools/build_release.sh ../vllm-v034 dist
 ```
 
 发布流程从 Release tag 构建，tag 必须与 `pyproject.toml` 中的版本对应，格式为
-`v<版本号>`。发布后，GitHub Actions 会把 WHL、源码包和校验文件附到对应 Release。
-手动运行该工作流时，可在该次运行的 Artifacts 中下载相同产物。
+`v<版本号>`。对于可变 Release，发布后工作流会附上 WHL、源码包和校验文件。
+对于不可变 Release，请先为现有 tag 创建草稿，再针对该 tag 手动运行
+`release-wheel.yml`，设置 `stage_draft=true`。等三个附件上传并校验后再发布草稿。
+手动运行时使用默认输入，可在该次运行的 Artifacts 中下载相同产物。
 
 ## vLLM 兼容补丁
 

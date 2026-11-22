@@ -4,6 +4,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      stage_draft:
+        description: Attach artifacts to an existing draft for this release tag
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -24,9 +29,9 @@ jobs:
         with:
           python-version: '3.12'
       - name: Check release tag matches the package version
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || inputs.stage_draft == true
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
         run: |
           version=$(python -c 'import tomllib; from pathlib import Path; print(tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"])')
           if [[ "$RELEASE_TAG" != "v$version" || "$GITHUB_REF" != "refs/tags/$RELEASE_TAG" ]]; then
@@ -52,7 +57,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || inputs.stage_draft == true
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -65,12 +70,21 @@ jobs:
       - name: Attach verified assets to the release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+          STAGE_DRAFT: ${{ inputs.stage_draft == true }}
         working-directory: dist
         run: |
           sha256sum --check SHA256SUMS
-          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")
-          jq -e --arg tag "$RELEASE_TAG" '.draft == false and .tag_name == $tag' <<<"$release" >/dev/null
+          if [[ "$STAGE_DRAFT" == true ]]; then
+            release=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate --slurp |
+              jq -e --arg tag "$RELEASE_TAG" '
+                [.[][] | select(.draft == true and .tag_name == $tag)] |
+                if length == 1 then .[0] else error("Expected one draft for the selected tag") end')
+          else
+            release=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")
+          fi
+          jq -e --arg tag "$RELEASE_TAG" --argjson draft "$STAGE_DRAFT" \
+            '.draft == $draft and .tag_name == $tag' <<<"$release" >/dev/null
           missing=()
           for asset in ./*.whl ./*.tar.gz ./SHA256SUMS; do
             name=${asset#./}
@@ -84,5 +98,28 @@ jobs:
             fi
           done
           if (( ${#missing[@]} )); then
-            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "${missing[@]}"
+            if jq -e '.immutable == true' <<<"$release" >/dev/null; then
+              echo 'An immutable release must have its assets staged before publication.' >&2
+              exit 1
+            fi
+            if [[ "$STAGE_DRAFT" == false ]]; then
+              gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "${missing[@]}"
+              exit 0
+            fi
+            release_id=$(jq -er '.id | numbers' <<<"$release")
+            upload_url="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets"
+            for asset in "${missing[@]}"; do
+              name=${asset#./}
+              expected=$(sha256sum -- "$asset" | cut -d ' ' -f 1)
+              uploaded=$(curl --fail-with-body --silent --show-error --request POST \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header 'Content-Type: application/octet-stream' \
+                --url-query "name=$name" --data-binary "@$asset" "$upload_url")
+              if ! jq -e --arg name "$name" --arg digest "sha256:$expected" \
+                '.state == "uploaded" and .name == $name and .digest == $digest' \
+                <<<"$uploaded" >/dev/null; then
+                printf 'Release asset %s upload did not return its expected digest\n' "$name" >&2
+                exit 1
+              fi
+            done
           fi

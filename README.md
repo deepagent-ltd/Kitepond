@@ -241,10 +241,13 @@ bash tools/build_release.sh ../vllm-v034 dist
 (cd dist && sha256sum --check SHA256SUMS)
 ```
 
-The release workflow builds from the release tag. The tag must be `v`
-followed by the package version in `pyproject.toml`. Publishing the release
-attaches the wheel, source archive and checksums. A manual Actions run builds
-the same files and stores them in the run's artifacts.
+The release workflow builds from a tag named `v` followed by the version in
+`pyproject.toml`. For a mutable release, publishing it attaches the wheel,
+source archive and checksums. For an immutable release, create a draft for the
+existing tag and run `release-wheel.yml` against that tag with
+`stage_draft=true`. Publish the draft after the job attaches and verifies all
+three assets. A manual run with the default input builds the same files for
+download from the run's artifacts.
 
 ## vLLM compatibility patches
 
