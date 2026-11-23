@@ -244,10 +244,12 @@ bash tools/build_release.sh ../vllm-v034 dist
 The release workflow builds from a tag named `v` followed by the version in
 `pyproject.toml`. For a mutable release, publishing it attaches the wheel,
 source archive and checksums. For an immutable release, create a draft for the
-existing tag and run `release-wheel.yml` against that tag with
-`stage_draft=true`. Publish the draft after the job attaches and verifies all
-three assets. A manual run with the default input builds the same files for
-download from the run's artifacts.
+existing tag. A manual run with the default inputs builds the wheel, source
+archive and checksum manifest for download from the run's artifacts. After
+verifying the artifacts, run `release-wheel.yml` against the tag again with
+`stage_draft=true`, the full Git commit as `expected_source_commit`, and the
+SHA-256 of the verified `SHA256SUMS` file as `expected_manifest_sha256`.
+Publish the draft after the job attaches and verifies all three assets.
 
 ## vLLM compatibility patches
 
