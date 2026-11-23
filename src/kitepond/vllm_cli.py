@@ -115,7 +115,7 @@ def _configure_host_pool(args: argparse.Namespace, dp: bool, dcp: int, runtime: 
     args.kv_transfer_config = replace(transfer, kv_connector_extra_config=options)
 
 
-def _configure_dcp8_speculation(args: argparse.Namespace) -> None:
+def _configure_dcp8_speculation(args: argparse.Namespace, *, full_glm: bool = False) -> None:
     if any(
         option is not None
         for option in (args.spec_method, args.spec_model, args.spec_tokens)
@@ -123,6 +123,11 @@ def _configure_dcp8_speculation(args: argparse.Namespace) -> None:
         raise ValueError("DCP8 MTP3 requires --speculative-config")
     requested = args.speculative_config
     if requested is None:
+        if full_glm:
+            raise ValueError(
+                'Full GLM-5.3 requires --speculative-config '
+                '{"method":"mtp","num_speculative_tokens":3}'
+            )
         return
 
     mtp3 = {
@@ -147,9 +152,10 @@ def _configure_dcp8_speculation(args: argparse.Namespace) -> None:
             '{"method":"mtp","num_speculative_tokens":3} with draft TP8/DCP8'
         )
     args.speculative_config = mtp3
-    args.attention_config = replace(
-        args.attention_config, enable_glm_flash_dcp8_mtp3=True
-    )
+    if not full_glm:
+        args.attention_config = replace(
+            args.attention_config, enable_glm_flash_dcp8_mtp3=True
+        )
 
 
 def _prepare_serve(args: argparse.Namespace) -> None:
@@ -173,14 +179,23 @@ def _prepare_serve(args: argparse.Namespace) -> None:
     ):
         raise ValueError("Kitepond requires a single-node topology, PP1 and PCP1")
 
+    # Match ServeSubcommand.cmd before EngineArgs is built for device selection.
+    args.model = args.model_tag or args.model
+    model = inspect_checkpoint(Path(args.model))
+    full_glm = model.kind == CheckpointKind.MODEL_OPT_MIXED
+    if full_glm and mode != (8, 1, 8):
+        raise ValueError("Full GLM-5.3 NVFP4 requires TP8 with DP1 and DCP8")
+    if model.kind == CheckpointKind.FLASH_FP8 and mode != (8, 1, 1):
+        raise ValueError("GLM-5.3-Flash FP8 requires TP8 with DP1 and DCP1")
+
     _, dp, dcp = mode
     _require(args, enable_expert_parallel=True, data_parallel_size_local=dp)
     _require(args, kv_cache_dtype="fp8_ds_mla" if dcp == 8 else "fp8")
     if dcp == 8:
-        _configure_dcp8_speculation(args)
+        _configure_dcp8_speculation(args, full_glm=full_glm)
         _require(
             args,
-            block_size=256,
+            block_size=64 if full_glm else 256,
             cp_kv_cache_interleave_size=4,
             dcp_comm_backend="ag_rs",
             distributed_executor_backend="mp",
@@ -189,15 +204,15 @@ def _prepare_serve(args: argparse.Namespace) -> None:
             mamba_cache_mode="none",
         )
 
-    # Match ServeSubcommand.cmd before EngineArgs is built for device selection.
-    args.model = args.model_tag or args.model
-    model = inspect_checkpoint(Path(args.model))
-    if model.kind == CheckpointKind.FLASH_FP8:
-        if mode != (8, 1, 1):
-            raise ValueError("GLM-5.3-Flash FP8 requires TP8 with DP1 and DCP1")
-    elif model.kind != CheckpointKind.FLASH_NVFP4:
-        raise ValueError("supported checkpoints are GLM-5.3-Flash NVFP4 and FP8")
     attention = args.attention_config
+    if full_glm:
+        _require(args, dcp_q_replicate=False)
+        if attention.enable_glm_flash_dcp8_mtp3:
+            raise ValueError("Full GLM-5.3 uses the DeepseekV32 MTP layer")
+        attention = replace(attention, enable_glm53_full_dcp8=True)
+    elif attention.enable_glm53_full_dcp8:
+        raise ValueError("The full GLM-5.3 layout requires the full checkpoint")
+
     backend = attention.backend_per_kind.get("mla_attention")
     if backend is None:
         backend = args.attention_backend or attention.backend
@@ -209,11 +224,20 @@ def _prepare_serve(args: argparse.Namespace) -> None:
 
     sparse = attention.hisparse_config or HiSparseConfig()
     changes = {}
-    if sparse.indexer_block_size is None:
+    if full_glm:
+        if (
+            sparse.indexer_block_size is not None
+            or sparse.pack_hot_groups
+            or sparse.full_glm_b64_row_alias
+        ):
+            raise ValueError(
+                "Full GLM-5.3 MTP3 requires native B64 indexer and resident groups"
+            )
+    elif sparse.indexer_block_size is None:
         changes["indexer_block_size"] = 8192 if dp == 8 else 2048
     if dcp == 8:
         changes["enable_dcp8"] = True
-        if sparse.pack_hot_groups is None:
+        if not full_glm and sparse.pack_hot_groups is None:
             changes["pack_hot_groups"] = True
     args.attention_config = replace(attention, hisparse_config=replace(sparse, **changes))
     _configure_host_pool(args, dp == 8, dcp, Path(os.environ["KITEPOND_RUNTIME_DIR"]))

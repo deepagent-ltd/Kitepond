@@ -44,6 +44,19 @@ class DCP8SpeculationTests(TestCase):
                 self.assertTrue(args.attention_config.enable_glm_flash_dcp8_mtp3)
                 self.assertEqual(args.speculative_config, expected)
 
+    def test_full_model_requires_mtp3_without_enabling_the_flash_layout(self):
+        with self.assertRaisesRegex(ValueError, "Full GLM-5.3 requires"):
+            _configure_dcp8_speculation(arguments(), full_glm=True)
+
+        request = {"method": "mtp", "num_speculative_tokens": 3}
+        args = arguments(request)
+        _configure_dcp8_speculation(args, full_glm=True)
+        self.assertFalse(args.attention_config.enable_glm_flash_dcp8_mtp3)
+        self.assertEqual(
+            args.speculative_config,
+            request | {"draft_tensor_parallel_size": 8, "draft_decode_context_parallel_size": 8},
+        )
+
     def test_rejects_draft_layout_or_method_overrides(self):
         base = {"method": "mtp", "num_speculative_tokens": 3}
         invalid = (
