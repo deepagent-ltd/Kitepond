@@ -1,0 +1,36 @@
+From d1623e85c265d1c25f582d5e97827ac29d33c815 Mon Sep 17 00:00:00 2001
+From: deepagent-ai <deepagent-ai@deepagent.ltd>
+Date: Tue, 24 Nov 2026 03:07:01 +0000
+Subject: [PATCH] Pad default prefill metadata for inactive FULL graph request
+ rows
+
+---
+ vllm/v1/worker/gpu/model_states/default.py | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/worker/gpu/model_states/default.py b/vllm/v1/worker/gpu/model_states/default.py
+index 0ea8f3d..ab9c472 100644
+--- a/vllm/v1/worker/gpu/model_states/default.py
++++ b/vllm/v1/worker/gpu/model_states/default.py
+@@ -218,6 +218,12 @@ class DefaultModelState(ModelState):
+             dcp_local_seq_lens_cpu_upper_bound = (
+                 input_batch.pcp.dcp_local_seq_lens_cpu_upper_bound
+             )
++        is_prefilling = torch.from_numpy(input_batch.is_prefilling_np)
++        if is_prefilling.numel() < num_reqs:
++            # Padded FULL-graph rows have no prefill work.
++            is_prefilling = torch.nn.functional.pad(
++                is_prefilling, (0, num_reqs - is_prefilling.numel()), value=False
++            )
+         attn_metadata = build_attn_metadata(
+             attn_groups=attn_groups,
+             num_reqs=num_reqs,
+@@ -234,7 +240,7 @@ class DefaultModelState(ModelState):
+             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+             dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
+             positions=input_batch.positions,
+-            is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
++            is_prefilling=is_prefilling,
+             mm_req_doc_ranges=req_doc_ranges,
+             for_cudagraph_capture=for_capture,
+             is_dummy=input_batch.is_dummy,
