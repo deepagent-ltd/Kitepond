@@ -69,6 +69,8 @@ def _validate_source(config: VllmConfig, cache: KVCacheConfig, size: int) -> Non
     # The engine revalidates the exact selected model/layout in _owner_rank().
     page_rows, row_bytes = (64, 656) if is_full_glm else (256, 528)
     per_layer = tuple(iter_layer_specs(source))
+    # The Full profile has 78 target layers and one source for its native draft.
+    full_draft_layers = int(getattr(config, "speculative_config", None) is not None)
     pages = cache.hisparse_host_num_blocks
     stride = cache.hisparse_host_block_stride
     host_tensors = [tensor for tensor in cache.kv_cache_tensors if tensor.host_resident]
@@ -76,7 +78,13 @@ def _validate_source(config: VllmConfig, cache: KVCacheConfig, size: int) -> Non
         source.block_size != page_rows
         or not source.dcp_sharded
         or not per_layer
-        or (is_full_glm and len(source_group.layer_names) != 78)
+        or (
+            is_full_glm
+            and (
+                len(source_group.layer_names) != 78 + full_draft_layers
+                or len(per_layer) != len(source_group.layer_names)
+            )
+        )
         or any(
             not isinstance(spec, MLAAttentionSpec)
             or not spec.dcp_sharded
@@ -94,6 +102,10 @@ def _validate_source(config: VllmConfig, cache: KVCacheConfig, size: int) -> Non
                 )
             )
             for spec in per_layer
+        )
+        or (
+            is_full_glm
+            and sum(spec.is_draft for spec in per_layer) != full_draft_layers
         )
         or type(pages) is not int
         or pages <= 0

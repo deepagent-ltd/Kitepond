@@ -80,16 +80,22 @@ TTFT, and TPOT under long-context recall are still being benchmarked.
 
 ## Verified setup
 
-The launch instructions below use the official Linux amd64 vLLM 0.34.0 image,
-eight NVIDIA RTX 6000D GPUs, and the GLM-5.3-Flash NVFP4 checkpoint.
-Each profile passed request generation at 90% GPU memory utilization and a
-131,072-token context limit.
+The following single-node profiles use eight NVIDIA RTX 6000D GPUs and the
+official Linux amd64 vLLM 0.34.0 image. The Flash rows use a 131,072-token
+context limit. The Full GLM-5.3 recipe uses 16,384 tokens and 32 sequences.
 
-| Single-node profile | MTP draft tokens | HiSparse host RAM |
-| --- | ---: | --- |
-| DP8 + EP8 | 3 | 48 GiB per DP rank, 384 GiB total |
-| TP8 + EP8 + DCP1 | 3 | One 384 GiB shared pool |
-| TP8 + EP8 + DCP8 | 0 | 48 GiB per rank, 384 GiB total |
+| Checkpoint | Single-node profile | MTP draft tokens | GPU memory utilization | HiSparse host RAM |
+| --- | --- | ---: | ---: | --- |
+| GLM-5.3-Flash NVFP4 | DP8 + EP8 | 3 | 0.90 | 48 GiB per DP rank, 384 GiB total |
+| GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP1 | 3 | 0.90 | One 384 GiB shared pool |
+| GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP8 | 0 | 0.90 | 48 GiB per rank, 384 GiB total |
+| GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP8 | 3, opt-in | 0.92 | 2 GiB per rank, 16 GiB total |
+| GLM-5.3-Flash FP8 | TP8 + EP8 + DCP1 | 3 | 0.90 | One 384 GiB shared pool |
+| GLM-5.3 NVFP4 (Full) | TP8 + EP8 + DCP8 | 3 | 0.90 | 48 GiB per rank, 384 GiB total |
+
+The NVFP4 DCP8 MTP3 opt-in was tested with up to 16 configured sequences and
+positive host-to-device recall. Its C32 precision regression and the final
+wheel qualification are pending.
 
 Allow additional host RAM for the model loader, workers, and operating
 system. DP8 requests and their KV remain on their assigned DP rank. The
@@ -98,7 +104,11 @@ GPUs, and P/D deployment require separate qualification.
 
 ## Install and run the wheel
 
-Have `kitepond-0.1.0-py3-none-any.whl` and the complete model checkpoint on
+To try the 0.2.0 source branch, [build the wheel below](#build-the-wheel-from-source).
+Published wheels and SHA-256 checksums appear under
+[GitHub Releases](https://github.com/deepagent-ltd/Kitepond/releases).
+
+Have `kitepond-0.2.0-py3-none-any.whl` and the complete model checkpoint on
 the GPU host. Set the two paths in this example and start the container.
 
 ```bash
@@ -123,7 +133,7 @@ topology and reports conflicting configuration values as startup errors.
 
 ```bash
 uv pip install --system --offline --no-index --no-deps \
-  /artifacts/kitepond-0.1.0-py3-none-any.whl
+  /artifacts/kitepond-0.2.0-py3-none-any.whl
 kitepond serve --enable --help=all
 ```
 
@@ -190,59 +200,88 @@ an installed wheel. Pass the in-container model path and policy JSON path to
 either script. Use a writable directory for the policy so workers can create
 lease locks next to it.
 
+### Opt in to MTP3 on TP8 + DCP8
+
+The DCP8 script defaults to MTP0. On the GLM-5.3-Flash NVFP4 profile,
+set `KITEPOND_DCP8_MTP=3` to use the checkpoint's native MTP layer.
+The script uses a 16 GiB HiSparse host pool and 92% GPU memory utilization
+for this profile. Create a writable policy directory and run the exact
+profile with the following commands.
+
+```bash
+policy_dir=$(mktemp -d)
+printf '%s\n' '{"rank_bytes":2147483648,"total_bytes":17179869184}' > "$policy_dir/policy.json"
+KITEPOND_DCP8_MTP=3 bash examples/serve_glm53_flash_nvfp4_dcp8.sh \
+  /models/GLM-5.3-FLASH-NVFP4 "$policy_dir/policy.json"
+```
+
+For a custom DCP8 command, pass
+`--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`.
+Kitepond supplies draft TP8 and draft DCP8. Keep source blocks at 256,
+indexer blocks at 2048, and graph mode at `FULL_AND_PIECEWISE`.
+This opt-in is limited to 131,072 context tokens, 16 sequences, and 2,048
+batched tokens. The capacity figures above use MTP0.
+
+### TP8 + DCP1
+
 For TP8 + DCP1, start the container with `--shm-size 416g` for the native
 shared pool. In the inline DP8 command, set tensor parallel size to 8 and
 both data parallel sizes to 1. Keep decode context parallel size at 1.
 Use `attention='{"hisparse_config":{"indexer_block_size":2048}}'` and
 `transfer='{"kv_connector":"HiSparseConnector","kv_role":"kv_both","kv_connector_extra_config":{"host_pool_gib":384}}'`.
 This profile uses the native shared pool and needs no external lease policy.
+For the FP8 compatibility profile, use the GLM-5.3-Flash FP8 checkpoint path
+with these same TP8/DCP1 settings and MTP3.
+
+### Full GLM-5.3 NVFP4 with TP8 + EP8 + DCP8
+
+Mount the Full ModelOpt NVFP4 checkpoint in the container and run the
+[Full GLM-5.3 example](examples/serve_glm53_full_nvfp4_dcp8.sh).
+
+```bash
+bash examples/serve_glm53_full_nvfp4_dcp8.sh /models/GLM-5.3-NVFP4
+```
+
+The example uses MTP3, packed FP8 MLA KV, and native 64-token blocks. Leave
+the HiSparse indexer layout at its default for this checkpoint. The 32-sequence
+GPU run covered 30 FULL CUDA Graph replays with 31 active requests. In a
+separate capacity run with MTP disabled, the eight-GPU KV allocation was
+128.94 → 133.03 GiB. With sufficient host RAM, this corresponds to 2.45 →
+28.36 Mi tokens of effective capacity, approximately 11.6×.
 
 ## Build the wheel from source
 
-Run from a clean Kitepond checkout on a Linux host with Git and Docker.
-The build uses the same vLLM image as the wheel installation. It needs
-the pinned upstream Git source and can run without a GPU.
+Run from a clean Kitepond checkout on a Linux host with Git and Python 3.12.
+The builder packages the current Git commit with the pinned vLLM source and
+uses stock compatibility fingerprints captured from the official image listed
+above. Building the wheel does not need Docker or a GPU.
 
 ```bash
-VLLM_IMAGE=vllm/vllm-openai@sha256:cf5b2fdd087eb4f6d261736967cc5cde974bd22ff4df50365f8fa419b6b4c484
-
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install setuptools==80.9.0
 git clone --depth 1 --branch v0.34.0 https://github.com/vllm-project/vllm.git ../vllm-v034
 test "$(git -C ../vllm-v034 rev-parse HEAD)" = 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
-bash tools/stage_v034_runtime.sh ../vllm-v034 ./runtime-sources
-mkdir -p dist
-
-docker run --rm -i --platform linux/amd64 --runtime runc --network none \
-  -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES= \
-  --mount "type=bind,source=$PWD,target=/src,readonly" \
-  --mount "type=bind,source=$PWD/dist,target=/artifacts" \
-  --entrypoint /bin/bash "$VLLM_IMAGE" -se <<'BUILD'
-uv venv --offline --system-site-packages --python /usr/bin/python3 /tmp/kitepond-build
-python_bin=/tmp/kitepond-build/bin/python
-mkdir /tmp/build
-tar -C /src --exclude='./.git' --exclude='./.venv' --exclude='./dist' --exclude='./docs' -cf - . |
-  tar -xf - -C /tmp/build
-cd /tmp/build
-
-"$python_bin" tools/seal_v034_runtime.py \
-  --sources ./runtime-sources --output src/kitepond/v034-runtime.zip \
-  --target 29ec998892e24f6372c291bd2ac1c45f76727808
-"$python_bin" -c 'from setuptools.build_meta import build_sdist; build_sdist("/artifacts")'
-mkdir /tmp/sdist
-tar -xzf /artifacts/kitepond-0.1.0.tar.gz -C /tmp/sdist
-cd /tmp/sdist/kitepond-0.1.0
-"$python_bin" -c 'from setuptools.build_meta import build_wheel; build_wheel("/artifacts")'
-BUILD
+bash tools/build_release.sh ../vllm-v034 dist
+(cd dist && sha256sum --check SHA256SUMS)
 ```
 
-Install the resulting `dist/kitepond-0.1.0-py3-none-any.whl` using the wheel
-instructions above. The source archive is `dist/kitepond-0.1.0.tar.gz`.
+The release workflow builds from a tag named `v` followed by the version in
+`pyproject.toml`. For a mutable release, publishing it attaches the wheel,
+source archive and checksums. For an immutable release, create a draft for the
+existing tag. A manual run with the default inputs builds the wheel, source
+archive and checksum manifest for download from the run's artifacts. After
+verifying the artifacts, run `release-wheel.yml` against the tag again with
+`stage_draft=true`, the full Git commit as `expected_source_commit`, and the
+SHA-256 of the verified `SHA256SUMS` file as `expected_manifest_sha256`.
+Publish the draft after the job attaches and verifies all three assets.
 
 ## vLLM compatibility patches
 
-The source build applies the seven patches in `compat/vllm-v034/` to vLLM
+The source build applies the patches in `compat/vllm-v034/` to vLLM
 0.34.0 and packages the resulting Python files inside the wheel. They cover
-HiSparse host memory leases and SM120 DCP8, scheduler and worker lifecycle,
-and Mooncake handoff and host-page retention. The wheel checks the pinned
+HiSparse host memory leases, SM120 DCP8 and native MTP3, scheduler and worker
+lifecycle, and Mooncake handoff and host-page retention. The wheel checks the pinned
 official vLLM image when `kitepond serve` is invoked with `--enable` and loads
 the compatibility files for that server process. This is the installation path
 until the required extension interfaces land upstream. We aim to bring this

@@ -1,0 +1,151 @@
+name: Build release wheel
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      stage_draft:
+        description: Attach artifacts to an existing draft for this release tag
+        type: boolean
+        default: false
+      expected_source_commit:
+        description: Independently verified full Git commit required when staging a draft
+        type: string
+      expected_manifest_sha256:
+        description: Independently verified SHA-256 of SHA256SUMS required when staging a draft
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-wheel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Check release tag matches the package version
+        if: github.event_name == 'release' || inputs.stage_draft == true
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          version=$(python -c 'import tomllib; from pathlib import Path; print(tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"])')
+          if [[ "$RELEASE_TAG" != "v$version" || "$GITHUB_REF" != "refs/tags/$RELEASE_TAG" ]]; then
+            printf 'Expected release tag v%s, got %s\n' "$version" "$RELEASE_TAG" >&2
+            exit 1
+          fi
+      - name: Bind draft staging to the verified source and manifest
+        if: inputs.stage_draft == true
+        env:
+          EXPECTED_SOURCE_COMMIT: ${{ inputs.expected_source_commit }}
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_manifest_sha256 }}
+        run: |
+          if [[ ! "$EXPECTED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ || "$(git rev-parse HEAD)" != "$EXPECTED_SOURCE_COMMIT" ]]; then
+            echo 'Draft staging requires the independently verified source commit.' >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo 'Draft staging requires the independently verified SHA256SUMS digest.' >&2
+            exit 1
+          fi
+      - name: Fetch pinned vLLM source
+        run: |
+          git clone --depth 1 --branch v0.34.0 https://github.com/vllm-project/vllm.git "$RUNNER_TEMP/vllm-v034"
+          test "$(git -C "$RUNNER_TEMP/vllm-v034" rev-parse HEAD)" = 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
+      - name: Build and verify release artifacts
+        run: |
+          python -m pip install setuptools==80.9.0
+          bash tools/build_release.sh "$RUNNER_TEMP/vllm-v034" dist
+          (cd dist && sha256sum --check SHA256SUMS)
+      - name: Check the built manifest against the verified digest
+        if: inputs.stage_draft == true
+        env:
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_manifest_sha256 }}
+        working-directory: dist
+        run: printf '%s  SHA256SUMS\n' "$EXPECTED_MANIFEST_SHA256" | sha256sum --check --strict
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: kitepond-release-dist
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'release' || inputs.stage_draft == true
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: kitepond-release-dist
+          path: dist
+      - name: Attach verified assets to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+          STAGE_DRAFT: ${{ inputs.stage_draft == true }}
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_manifest_sha256 }}
+        working-directory: dist
+        run: |
+          if [[ "$STAGE_DRAFT" == true ]]; then
+            printf '%s  SHA256SUMS\n' "$EXPECTED_MANIFEST_SHA256" | sha256sum --check --strict
+          fi
+          sha256sum --check --strict SHA256SUMS
+          if [[ "$STAGE_DRAFT" == true ]]; then
+            release=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate --slurp |
+              jq -e --arg tag "$RELEASE_TAG" '
+                [.[][] | select(.draft == true and .tag_name == $tag)] |
+                if length == 1 then .[0] else error("Expected one draft for the selected tag") end')
+          else
+            release=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")
+          fi
+          jq -e --arg tag "$RELEASE_TAG" --argjson draft "$STAGE_DRAFT" \
+            '.draft == $draft and .tag_name == $tag' <<<"$release" >/dev/null
+          missing=()
+          for asset in ./*.whl ./*.tar.gz ./SHA256SUMS; do
+            name=${asset#./}
+            expected=$(sha256sum -- "$asset" | cut -d ' ' -f 1)
+            observed=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .digest // "unknown"' <<<"$release")
+            if [[ -z "$observed" ]]; then
+              missing+=("$asset")
+            elif [[ "$observed" != "sha256:$expected" ]]; then
+              printf 'Release asset %s already exists with a different or unverifiable digest\n' "$name" >&2
+              exit 1
+            fi
+          done
+          if (( ${#missing[@]} )); then
+            if jq -e '.immutable == true' <<<"$release" >/dev/null; then
+              echo 'An immutable release must have its assets staged before publication.' >&2
+              exit 1
+            fi
+            release_id=$(jq -er '.id | numbers' <<<"$release")
+            upload_url="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets"
+            for asset in "${missing[@]}"; do
+              name=${asset#./}
+              expected=$(sha256sum -- "$asset" | cut -d ' ' -f 1)
+              uploaded=$(curl --fail-with-body --silent --show-error --request POST \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header 'Content-Type: application/octet-stream' \
+                --url-query "name=$name" --data-binary "@$asset" "$upload_url")
+              if ! jq -e --arg name "$name" --arg digest "sha256:$expected" \
+                '.state == "uploaded" and .name == $name and .digest == $digest' \
+                <<<"$uploaded" >/dev/null; then
+                printf 'Release asset %s upload did not return its expected digest\n' "$name" >&2
+                exit 1
+              fi
+            done
+          fi

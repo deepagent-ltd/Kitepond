@@ -66,22 +66,30 @@ TPOT 仍在测试。
 
 ## 已验证的环境
 
-以下启动方法使用官方 Linux amd64 vLLM 0.34.0 镜像、8 张 NVIDIA RTX 6000D 和
-GLM-5.3-Flash NVFP4 权重。表中各构型均在 GPU 显存利用率 90%、上下文上限 131,072 token
-的条件下通过请求生成验证。
+下表各单机构型均使用官方 Linux amd64 vLLM 0.34.0 镜像和 8 张 NVIDIA RTX 6000D。
+Flash 构型的上下文上限为 131,072 token。完整版 GLM-5.3 示例为 16,384 token，最多 32 条序列。
 
-| 单机构型 | MTP 草稿 token 数 | HiSparse 主存 |
-| --- | ---: | --- |
-| DP8 + EP8 | 3 | 每个 DP rank 48 GiB，共 384 GiB |
-| TP8 + EP8 + DCP1 | 3 | 共享 384 GiB |
-| TP8 + EP8 + DCP8 | 0 | 每个 rank 48 GiB，共 384 GiB |
+| 权重 | 单机构型 | MTP 草稿 token 数 | GPU 显存利用率 | HiSparse 主存 |
+| --- | --- | ---: | ---: | --- |
+| GLM-5.3-Flash NVFP4 | DP8 + EP8 | 3 | 0.90 | 每个 DP rank 48 GiB，共 384 GiB |
+| GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP1 | 3 | 0.90 | 共享 384 GiB |
+| GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP8 | 0 | 0.90 | 每个 rank 48 GiB，共 384 GiB |
+| GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP8 | 3，显式启用 | 0.92 | 每个 rank 2 GiB，共 16 GiB |
+| GLM-5.3-Flash FP8 | TP8 + EP8 + DCP1 | 3 | 0.90 | 共享 384 GiB |
+| GLM-5.3 NVFP4（完整版） | TP8 + EP8 + DCP8 | 3 | 0.90 | 每个 rank 48 GiB，共 384 GiB |
+
+NVFP4 的 DCP8 MTP3 构型在最大序列数设为 16 时验证了主存到显存的实际召回。
+C32 精度回归和最终 WHL 仍待验收。
 
 为模型加载、工作进程和操作系统另留主存。DP8 的请求及其 KV 都留在被分配的 DP rank。
 本文覆盖单机服务。其他权重、GPU 和 P/D 部署需单独验证。
 
 ## 安装和运行 WHL
 
-在 GPU 宿主机上准备 `kitepond-0.1.0-py3-none-any.whl` 和完整的模型权重。
+试用 0.2.0 源码分支时，请按下文[从源码构建 WHL](#从源码构建-whl)。
+正式发布的 WHL 与 SHA-256 校验文件见 [GitHub Releases](https://github.com/deepagent-ltd/Kitepond/releases)。
+
+在 GPU 宿主机上准备 `kitepond-0.2.0-py3-none-any.whl` 和完整的模型权重。
 替换示例中的两个本地路径后启动容器。
 
 ```bash
@@ -103,7 +111,7 @@ CUDA 扩展。张量并行、数据并行、专家并行和解码上下文并行
 
 ```bash
 uv pip install --system --offline --no-index --no-deps \
-  /artifacts/kitepond-0.1.0-py3-none-any.whl
+  /artifacts/kitepond-0.2.0-py3-none-any.whl
 kitepond serve --enable --help=all
 ```
 
@@ -167,56 +175,78 @@ curl -fsS http://127.0.0.1:8000/v1/completions \
 给脚本传入容器内的模型路径和 policy JSON 路径。policy 文件所在目录须可写，
 工作进程会在其旁边创建租约锁文件。
 
+### 在 TP8 + DCP8 上启用 MTP3
+
+DCP8 脚本默认使用 MTP0。使用 GLM-5.3-Flash NVFP4 时，可设置
+`KITEPOND_DCP8_MTP=3` 启用模型自带的 MTP 层。此配置使用 16 GiB HiSparse
+主存池和 92% 的 GPU 显存利用率。用以下命令创建可写的 policy 目录并启动。
+
+```bash
+policy_dir=$(mktemp -d)
+printf '%s\n' '{"rank_bytes":2147483648,"total_bytes":17179869184}' > "$policy_dir/policy.json"
+KITEPOND_DCP8_MTP=3 bash examples/serve_glm53_flash_nvfp4_dcp8.sh \
+  /models/GLM-5.3-FLASH-NVFP4 "$policy_dir/policy.json"
+```
+
+自定义 DCP8 启动命令可加上
+`--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`。
+Kitepond 会设置 draft TP8 和 draft DCP8。源块大小仍为 256，索引块大小为 2048，
+图模式为 `FULL_AND_PIECEWISE`。此选项的上限为 131,072 个上下文 token、
+16 条序列和 2,048 个批处理 token。上文公布的容量数字使用 MTP0。
+
+### TP8 + DCP1
+
 使用 TP8 + DCP1 时，在启动容器时设置 `--shm-size 416g` 供原生共享池使用。
 在上面的 DP8 命令中，把 tensor parallel size 改为 8，两个 data parallel size 都改为 1，
 decode context parallel size 保持为 1。设置
 `attention='{"hisparse_config":{"indexer_block_size":2048}}'` 和
 `transfer='{"kv_connector":"HiSparseConnector","kv_role":"kv_both","kv_connector_extra_config":{"host_pool_gib":384}}'`。
 这个构型使用原生共享池，无需外部租约 policy。
+使用 FP8 权重时，将模型路径换成 GLM-5.3-Flash FP8，保留上述 TP8/DCP1 设置并启用 MTP3。
+
+### 完整版 GLM-5.3 NVFP4 使用 TP8 + EP8 + DCP8
+
+将完整版 ModelOpt NVFP4 权重挂载到容器，运行
+[完整版 GLM-5.3 启动示例](examples/serve_glm53_full_nvfp4_dcp8.sh)。
+
+```bash
+bash examples/serve_glm53_full_nvfp4_dcp8.sh /models/GLM-5.3-NVFP4
+```
+
+示例使用 MTP3、紧凑 FP8 MLA KV 和原生 64-token 块，HiSparse 索引布局使用模型默认值。
+32 路实机测试覆盖了 30 次 31 条活动请求落入 32 档 FULL CUDA Graph 的回放。
+独立的 MTP 关闭容量测试中，八卡实际 KV 池为 128.94 → 133.03 GiB。主存充足时，
+整机有效容量为 2.45 → 28.36 Mi token，约 11.6 倍。
 
 ## 从源码构建 WHL
 
-在安装了 Git 和 Docker 的 Linux 宿主机上，从干净的 Kitepond 源码目录执行以下命令。
-构建使用与 WHL 安装相同的 vLLM 镜像和固定版本的上游 Git 源码，可在无 GPU 的机器上运行。
+在安装了 Git 和 Python 3.12 的 Linux 宿主机上，从干净的 Kitepond 源码目录执行以下命令。
+构建读取当前 Git 提交和固定版本的 vLLM 源码，并使用从上文官方镜像采集的兼容性指纹。
+构建过程无需 Docker 或 GPU。
 
 ```bash
-VLLM_IMAGE=vllm/vllm-openai@sha256:cf5b2fdd087eb4f6d261736967cc5cde974bd22ff4df50365f8fa419b6b4c484
-
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install setuptools==80.9.0
 git clone --depth 1 --branch v0.34.0 https://github.com/vllm-project/vllm.git ../vllm-v034
 test "$(git -C ../vllm-v034 rev-parse HEAD)" = 62d4bc3c7e33b1b6c906e233e6af2d3506c482ca
-bash tools/stage_v034_runtime.sh ../vllm-v034 ./runtime-sources
-mkdir -p dist
-
-docker run --rm -i --platform linux/amd64 --runtime runc --network none \
-  -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES= \
-  --mount "type=bind,source=$PWD,target=/src,readonly" \
-  --mount "type=bind,source=$PWD/dist,target=/artifacts" \
-  --entrypoint /bin/bash "$VLLM_IMAGE" -se <<'BUILD'
-uv venv --offline --system-site-packages --python /usr/bin/python3 /tmp/kitepond-build
-python_bin=/tmp/kitepond-build/bin/python
-mkdir /tmp/build
-tar -C /src --exclude='./.git' --exclude='./.venv' --exclude='./dist' --exclude='./docs' -cf - . |
-  tar -xf - -C /tmp/build
-cd /tmp/build
-
-"$python_bin" tools/seal_v034_runtime.py \
-  --sources ./runtime-sources --output src/kitepond/v034-runtime.zip \
-  --target 29ec998892e24f6372c291bd2ac1c45f76727808
-"$python_bin" -c 'from setuptools.build_meta import build_sdist; build_sdist("/artifacts")'
-mkdir /tmp/sdist
-tar -xzf /artifacts/kitepond-0.1.0.tar.gz -C /tmp/sdist
-cd /tmp/sdist/kitepond-0.1.0
-"$python_bin" -c 'from setuptools.build_meta import build_wheel; build_wheel("/artifacts")'
-BUILD
+bash tools/build_release.sh ../vllm-v034 dist
+(cd dist && sha256sum --check SHA256SUMS)
 ```
 
-按上文步骤安装生成的 `dist/kitepond-0.1.0-py3-none-any.whl`。
-源码包位于 `dist/kitepond-0.1.0.tar.gz`。
+发布流程从 Release tag 构建，tag 必须与 `pyproject.toml` 中的版本对应，格式为
+`v<版本号>`。对于可变 Release，发布后工作流会附上 WHL、源码包和校验文件。
+对于不可变 Release，请先为现有 tag 创建草稿。手动运行工作流并使用默认输入，
+可在该次运行的 Artifacts 中下载 WHL、源码包和校验文件。独立核验后，针对该 tag
+再次运行 `release-wheel.yml`，设置 `stage_draft=true`，在
+`expected_source_commit` 中填写完整的 Git commit，在
+`expected_manifest_sha256` 中填写经核验的 `SHA256SUMS` 文件的 SHA-256。
+等三个附件上传并校验后再发布草稿。
 
 ## vLLM 兼容补丁
 
-源码构建时将 `compat/vllm-v034/` 下的七份补丁应用到 vLLM 0.34.0，并把生成的 Python
-文件打入 WHL。补丁涉及 HiSparse 主存租约、SM120 DCP8、调度器与工作进程生命周期、
+源码构建时将 `compat/vllm-v034/` 下的补丁应用到 vLLM 0.34.0，并把生成的 Python
+文件打入 WHL。补丁涉及 HiSparse 主存租约、SM120 DCP8 和原生 MTP3、调度器与工作进程生命周期、
 Mooncake 交接和主存页保留。`kitepond serve` 带 `--enable` 启动时校验固定的官方 vLLM 镜像，
 只为该服务进程加载兼容文件。这是上游接口合入前的过渡方案。我们希望尽快将所需接口合入
 vLLM 主线，让用户能用 vLLM 原生命令启用 Kitepond。请从上文验证过的模型与构型中选择启动配置。

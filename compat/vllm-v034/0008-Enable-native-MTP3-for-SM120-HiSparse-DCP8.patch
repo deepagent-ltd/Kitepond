@@ -1,0 +1,380 @@
+From c5fc2ac4fc9298bb3c1bcf590e6b64de594f00fe Mon Sep 17 00:00:00 2001
+From: deepagent-ai <deepagent-ai@deepagent.ltd>
+Date: Sat, 21 Nov 2026 11:14:09 +0800
+Subject: [PATCH] Enable native MTP3 for compact SM120 HiSparse DCP8
+
+Capture the drafter slot mapping before each real graph replay. Mirror the draft group from its own source rows before acknowledging page transfers.
+
+Admit the fixed native MTP3 combination only on the qualified host-backed GLM Flash NVFP4 geometry. Retain the existing MTP0 layouts and fail closed for other speculative configurations.
+---
+ vllm/config/attention.py                      |  3 +
+ vllm/config/vllm.py                           |  6 ++
+ .../kv_connector/v1/hisparse/connector.py     |  4 ++
+ .../kv_connector/v1/hisparse/worker.py        | 63 ++++++++++++++++--
+ .../mla/flashinfer_mla_sparse_sm120.py        |  7 ++
+ vllm/v1/hisparse/dcp_layout.py                | 65 ++++++++++++++++++-
+ .../spec_decode/autoregressive/speculator.py  |  4 ++
+ .../worker/gpu/spec_decode/mtp/speculator.py  | 16 +++++
+ .../target_dependent_ar/speculator.py         |  2 +
+ 9 files changed, 161 insertions(+), 9 deletions(-)
+
+diff --git a/vllm/config/attention.py b/vllm/config/attention.py
+index 4c2328f..889831e 100644
+--- a/vllm/config/attention.py
++++ b/vllm/config/attention.py
+@@ -62,6 +62,9 @@ class HiSparseConfig:
+ class AttentionConfig:
+     """Configuration for attention mechanisms in vLLM."""
+ 
++    enable_glm_flash_dcp8_mtp3: bool = False
++    """Opt in to native MTP3 on compact GLM Flash SM120 HiSparse DCP8."""
++
+     enable_glm53_full_dcp8: bool = False
+     """Opt in to experimental SM120 DCP8 for full GLM-5.3-NVFP4."""
+ 
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 1fb8b46..85fa121 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1809,6 +1809,12 @@ class VllmConfig:
+         ):
+             self.attention_config.hisparse_config = HiSparseConfig()
+ 
++        if self.attention_config.enable_glm_flash_dcp8_mtp3 and (
++            self.attention_config.hisparse_config is None
++            or not self.attention_config.hisparse_config.enable_dcp8
++        ):
++            raise ValueError("GLM Flash DCP8 MTP3 requires HiSparse DCP8.")
++
+         if self.attention_config.hisparse_config is not None:
+             if current_platform.get_hisparse_backend_cls() is None:
+                 raise ValueError("The current platform does not support HiSparse.")
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/connector.py
+index 04c4e25..088add9 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/connector.py
+@@ -298,6 +298,10 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
+         assert self.connector_worker is not None
+         self.connector_worker.finish_forward()
+ 
++    def stage_draft_row_mirrors(self, num_tokens: int) -> None:
++        assert self.connector_worker is not None
++        self.connector_worker.stage_draft_row_mirrors(num_tokens)
++
+     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+         assert self.connector_worker is not None
+         self.connector_worker.register_kv_caches(kv_caches)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py
+index 86c8fb6..7b31854 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py
+@@ -61,7 +61,7 @@ class _DMADescriptors(NamedTuple):
+ 
+ @dataclass
+ class _SlotMappingStaging:
+-    stream: torch.Stream
++    stream: torch.Stream | None
+     event: torch.Event
+     slots: torch.Tensor
+     candidates: tuple[SparseKVRowMirror, ...] = ()
+@@ -246,6 +246,7 @@ class HiSparseConnectorWorker:
+     _in_step = False
+     kv_sharing_handles: tuple[HiSparseCacheHandle, ...] = ()
+     _dcp_mirror_geometry: tuple[int, int, int] | None = None
++    _draft_slot_mapping_staging: _SlotMappingStaging | None = None
+ 
+     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig) -> None:
+         self.backend = get_hisparse_backend()
+@@ -378,6 +379,20 @@ class HiSparseConnectorWorker:
+         self._draft_layers = tuple(
+             index for index, cache in enumerate(cache_handles) if cache.draft_layer
+         )
++        self._draft_slot_mapping_staging = None
++        if self.is_host_writer and self._dcp_mirror_geometry and self._draft_layers:
++            sources = {
++                cache_handles[index].runtime.resident_source_index
++                for index in self._draft_layers
++            }
++            if len(sources) != 1:
++                raise RuntimeError("HiSparse DCP draft layers must share a KV group.")
++            self._draft_slot_mapping_staging = _SlotMappingStaging(
++                stream=None,
++                event=torch.Event(),
++                slots=torch.empty(max_mirror_rows, dtype=torch.int64, pin_memory=True),
++                source_index=next(iter(sources)),
++            )
+         self._draft_mirror_pending = False
+         self._set_row_mirrors(())
+         self._group_leaders = tuple(
+@@ -505,6 +520,8 @@ class HiSparseConnectorWorker:
+             )
+         if self._slot_mapping_staging is not None:
+             self._slot_mapping_staging.candidates = mirrors
++        if self._draft_slot_mapping_staging is not None:
++            self._draft_slot_mapping_staging.candidates = mirrors
+         self._set_row_mirrors(mirrors)
+         self._clear_forward_mirror_state()
+         self._in_step = True
+@@ -572,16 +589,34 @@ class HiSparseConnectorWorker:
+                 f"{end} > {state.slots.shape[0]}."
+             )
+         main_stream = torch.accelerator.current_stream()
+-        state.stream.wait_stream(main_stream)
+-        with state.stream:
++        stream = state.stream
++        assert stream is not None
++        stream.wait_stream(main_stream)
++        with stream:
+             state.slots[start:end].copy_(
+                 slots[:num_tokens],
+                 non_blocking=True,
+             )
+-            state.event.record(state.stream)
++            state.event.record(stream)
+         state.num_tokens = end
+         state.source_index = source_index
+ 
++    def stage_draft_row_mirrors(self, num_tokens: int) -> None:
++        state = self._draft_slot_mapping_staging
++        if state is None or not self._draft_mirror_pending or not num_tokens:
++            return
++        slots = self.cache_handles[self._draft_layers[0]].slot_mapping
++        assert slots is not None
++        start = state.num_tokens
++        end = start + num_tokens
++        if num_tokens > slots.numel() or end > state.slots.numel():
++            raise ValueError("HiSparse draft row mapping exceeds staging capacity.")
++        # The native drafter overwrites the persistent mapping on the compute
++        # stream for each forward. Snapshot it on that stream before replay.
++        state.slots[start:end].copy_(slots[:num_tokens], non_blocking=True)
++        state.event.record(torch.accelerator.current_stream())
++        state.num_tokens = end
++
+     def _resolve_row_mirrors(self, state: _SlotMappingStaging) -> None:
+         """Compute the final row mirrors from the staged GPU slot mapping."""
+         self._set_row_mirrors(
+@@ -1008,6 +1043,18 @@ class HiSparseConnectorWorker:
+         """
+         if self._draft_mirror_pending:
+             self._draft_mirror_pending = False
++            state = self._draft_slot_mapping_staging
++            if state is not None:
++                if state.num_tokens:
++                    state.event.synchronize()
++                self._set_row_mirrors(
++                    _select_written_row_mirrors(
++                        state.candidates,
++                        np.unique(state.slots[: state.num_tokens].numpy()),
++                        state.source_index,
++                    )
++                )
++                state.num_tokens = 0
+             self._enqueue_row_dma(self._draft_layers)
+         transfers = self._post_forward_transfers
+         self._post_forward_transfers = []
+@@ -1034,8 +1081,12 @@ class HiSparseConnectorWorker:
+     def shutdown(self) -> None:
+         if not self._initialized:
+             return
+-        if self._slot_mapping_staging is not None:
+-            self._slot_mapping_staging.stream.synchronize()
++        target_state = self._slot_mapping_staging
++        if target_state is not None and target_state.stream is not None:
++            target_state.stream.synchronize()
++        state = self._draft_slot_mapping_staging
++        if state is not None and state.num_tokens:
++            state.event.synchronize()
+         if self.dma_stream is not None:
+             self.dma_stream.synchronize()
+         release_pinned_state(
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+index 0082c50..8788c75 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+@@ -100,6 +100,13 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
+                 vllm_config.model_config.hf_text_config, "model_type", None
+             )
+         self.kv_scale_format = _kv_scale_format_for_model(model_type)
++        self.supports_mtp_with_cp_non_trivial_interleave_size = (
++            vllm_config.attention_config.enable_glm_flash_dcp8_mtp3
++            and self.dcp_world_size == 8
++            and head_size == self.kv_lora_rank == 512
++            and self.qk_rope_head_dim == 0
++            and self.kv_scale_format == "arbitrary_fp32"
++        )
+ 
+         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+ 
+diff --git a/vllm/v1/hisparse/dcp_layout.py b/vllm/v1/hisparse/dcp_layout.py
+index 471d5b3..edaac82 100644
+--- a/vllm/v1/hisparse/dcp_layout.py
++++ b/vllm/v1/hisparse/dcp_layout.py
+@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
+ import torch
+ 
+ from vllm.config import VllmConfig, get_layers_from_vllm_config
++from vllm.config.compilation import CUDAGraphMode
+ from vllm.config.kv_transfer import hisparse_host_pool_gib
+ from vllm.distributed.parallel_state import GroupCoordinator
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+@@ -51,7 +52,7 @@ def _dcp8_source_geometry(config: VllmConfig) -> tuple[int, int]:
+ 
+ 
+ def validate_hisparse_dcp8_config(config: VllmConfig) -> None:
+-    """Restrict the first host-backed DCP lane to one exact native layout."""
++    """Validate the supported host-backed DCP8 layouts before allocation."""
+     hisparse = config.attention_config.hisparse_config
+     if hisparse is None or not hisparse.enable_dcp8:
+         raise ValueError("HiSparse does not support decode context parallelism.")
+@@ -75,12 +76,16 @@ def validate_hisparse_dcp8_config(config: VllmConfig) -> None:
+         or not parallel.enable_expert_parallel
+         or parallel.enable_eplb
+         or parallel.enable_elastic_ep
+-        or config.speculative_config is not None
+     ):
+         raise ValueError(
+             "HiSparse DCP8 requires single-node MP, TP8/EP8/DCP8/DP1/PP1/PCP1, "
+-            "interleave 4, ag_rs, and no speculative decoding or expert rebalancing."
++            "interleave 4, ag_rs, and no expert rebalancing."
+         )
++    if (
++        config.speculative_config is not None
++        and not config.attention_config.enable_glm_flash_dcp8_mtp3
++    ):
++        raise ValueError("HiSparse DCP8 requires explicit MTP3 opt-in.")
+ 
+     physical_rows, packed_row_bytes = _dcp8_source_geometry(config)
+     cache = config.cache_config
+@@ -196,6 +201,60 @@ def validate_hisparse_dcp8_config(config: VllmConfig) -> None:
+             "FLASHINFER_MLA_SPARSE_SM120 with FlashInfer >= 0.7.3."
+         )
+ 
++    if attention.enable_glm_flash_dcp8_mtp3:
++        _validate_glm_flash_dcp8_mtp3(config, is_flash_nvfp4, physical_rows)
++
++
++def _validate_glm_flash_dcp8_mtp3(
++    config: VllmConfig, is_flash_nvfp4: bool, physical_rows: int
++) -> None:
++    """Admit only the qualified native proposer on the compact host layout."""
++    model = config.model_config
++    spec = config.speculative_config
++    sparse = config.attention_config.hisparse_config
++    draft = spec.draft_model_config if spec is not None else None
++    if (
++        not is_flash_nvfp4
++        or physical_rows != 256
++        or sparse is None
++        or not sparse.pack_hot_groups
++        or sparse.indexer_block_size != 2048
++        or sparse.device_buffer_size not in (None, 10880)
++        or config.parallel_config.use_ubatching
++        or config.compilation_config.cudagraph_mode != CUDAGraphMode.FULL_AND_PIECEWISE
++        or model is None
++        or model.enforce_eager
++        or model.max_model_len > 131072
++        or config.scheduler_config.max_num_seqs > 16
++        or config.scheduler_config.max_num_batched_tokens > 2048
++        or spec is None
++        or spec.method != "mtp"
++        or spec.custom_method is not None
++        or spec.num_speculative_tokens != 3
++        or spec.uses_dynamic_speculative_decoding()
++        or spec.enable_adaptive_verification
++        or spec.rejection_sample_method != "standard"
++        or spec.draft_sample_method != "greedy"
++        or spec.draft_tensor_parallel_size != 8
++        or spec.draft_decode_context_parallel_size != 8
++        or spec.enforce_eager
++        or spec.kv_cache_dtype not in (None, "fp8_ds_mla")
++        or draft is None
++        or draft.architecture != "Glm5NextMTPModel"
++        or spec.num_mtp_modules() != 1
++        or not getattr(draft.hf_config, "index_share_for_mtp_iteration", False)
++        or draft.max_model_len != model.max_model_len
++        or draft.quantization != model.quantization
++        or spec.model != (model.model_weights or model.model)
++    ):
++        raise ValueError(
++            "GLM Flash HiSparse DCP8 MTP3 requires compact NVFP4 with packed "
++            "B256 source and B2048 indexer blocks, FULL_AND_PIECEWISE graphs, "
++            "standard fixed three-token MTP from the same checkpoint's single "
++            "draft layer with draft TP8/DCP8, and at most 131072 context tokens, "
++            "16 sequences, and 2048 batched tokens."
++        )
++
+ 
+ def validate_dcp8_rank_agreement(
+     group: GroupCoordinator,
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index f1e9fd0..608dc87 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -106,6 +106,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+ 
+     def on_prefill_end(self, num_reqs: int) -> None: ...
+ 
++    def _stage_draft_row_mirrors(self, num_tokens: int) -> None: ...
++
+     def on_multi_step_decode_begin(self, num_reqs: int) -> None: ...
+ 
+     def on_multi_step_decode_end(self, num_reqs: int) -> None: ...
+@@ -258,6 +260,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+                     step=step,
+                 )
+ 
++            if not skip_attn:
++                self._stage_draft_row_mirrors(num_reqs)
+             self.current_draft_step.fill_(step)
+             if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                 assert self.decode_cudagraph_manager is not None
+diff --git a/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py b/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py
+index a006419..dffb6e9 100644
+--- a/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py
+@@ -3,6 +3,10 @@
+ 
+ import torch.nn as nn
+ 
++from vllm.distributed.kv_transfer import (
++    get_kv_transfer_group,
++    has_kv_transfer_group,
++)
+ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+ from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
+     TargetDependentARSpeculator,
+@@ -35,6 +39,18 @@ class MTPSpeculator(TargetDependentARSpeculator):
+         )
+         return draft_model
+ 
++    def _stage_draft_row_mirrors(self, num_tokens: int) -> None:
++        hisparse = self.vllm_config.attention_config.hisparse_config
++        if hisparse is None or not hisparse.enable_dcp8 or not has_kv_transfer_group():
++            return
++        from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (
++            HiSparseConnector,
++        )
++
++        connector = get_kv_transfer_group()
++        if isinstance(connector, HiSparseConnector):
++            connector.stage_draft_row_mirrors(num_tokens)
++
+     def on_prefill_begin(self, num_reqs: int) -> None:
+         # Step 0 computes its own top-k. Unconditional, so a step that died
+         # midway cannot leave reuse mode on.
+diff --git a/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py b/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
+index b409f79..207b323 100644
+--- a/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
+@@ -226,6 +226,8 @@ class TargetDependentARSpeculator(AutoRegressiveSpeculator):
+             )
+ 
+         self.on_prefill_begin(num_reqs)
++        if not dummy_run and not skip_attn_for_dummy_run:
++            self._stage_draft_row_mirrors(num_tokens)
+         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
+             # Replay the full graph for draft prefill.
+             assert self.prefill_cudagraph_manager is not None
+-- 
+2.39.5 (Apple Git-154)
+

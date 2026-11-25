@@ -152,3 +152,73 @@ class DCP8HostBackingTest(unittest.TestCase):
             backing, release = provider.acquire(self.config, None, mmap.PAGESIZE)
             release()
             del backing
+
+
+class FullGLMHostSourceTest(unittest.TestCase):
+    def setUp(self):
+        torch = ModuleType("torch")
+        torch.uint8 = "uint8"
+        interface = ModuleType("vllm.v1.kv_cache_interface")
+        interface.MLAAttentionSpec = SimpleNamespace
+        interface.SparseCacheRole = SimpleNamespace(SPARSE="sparse")
+        interface.iter_layer_specs = lambda source: source.layers
+        self.enterContext(
+            patch.dict("sys.modules", {
+                "torch": torch,
+                "vllm.v1.kv_cache_interface": interface,
+            })
+        )
+
+    def source(self, *, actual_layers, actual_draft, speculative):
+        rows, row_bytes, pages = 64, 656, 2
+        stride = actual_layers * rows * row_bytes
+        geometry = {
+            "dcp_sharded": True,
+            "block_size": rows,
+            "cache_role": "sparse",
+            "cache_dtype_str": "fp8_ds_mla",
+            "tokens_per_state": 1,
+            "page_size_bytes": rows * row_bytes,
+            "head_size": 576,
+            "num_kv_heads": 1,
+            "dtype": "uint8",
+        }
+        source = SimpleNamespace(
+            block_size=rows, dcp_sharded=True, page_size_bytes=stride,
+            layers=tuple(
+                SimpleNamespace(**geometry, is_draft=index < actual_draft)
+                for index in range(actual_layers)
+            ),
+        )
+        group = SimpleNamespace(
+            kv_cache_spec=source, layer_names=[str(i) for i in range(actual_layers)]
+        )
+        cache = SimpleNamespace(
+            hisparse_shared_host_pool=False, host_group_ids=[0], kv_cache_groups=[group],
+            hisparse_host_num_blocks=pages, hisparse_host_block_stride=stride,
+            kv_cache_tensors=[SimpleNamespace(host_resident=True, size=pages * stride)],
+        )
+        config = SimpleNamespace(
+            attention_config=SimpleNamespace(enable_glm53_full_dcp8=True),
+            cache_config=SimpleNamespace(
+                get_resolved_kv_cache_layout=lambda: SimpleNamespace(is_block_outermost=True)
+            ),
+            speculative_config=object() if speculative else None,
+        )
+        return config, cache, pages * stride
+
+    def test_exact_target_and_optional_draft_source(self):
+        for layers, drafts, speculative in ((78, 0, False), (79, 1, True)):
+            with self.subTest(layers=layers, drafts=drafts):
+                provider._validate_source(*self.source(
+                    actual_layers=layers, actual_draft=drafts, speculative=speculative
+                ))
+
+    def test_incorrect_source_or_draft_count_is_rejected(self):
+        cases = ((78, 0, True), (79, 0, True), (79, 2, True), (79, 1, False))
+        for layers, drafts, speculative in cases:
+            with self.subTest(layers=layers, drafts=drafts, speculative=speculative):
+                with self.assertRaisesRegex(ValueError, "packed source layout"):
+                    provider._validate_source(*self.source(
+                        actual_layers=layers, actual_draft=drafts, speculative=speculative
+                    ))
