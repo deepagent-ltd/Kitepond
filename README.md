@@ -80,8 +80,9 @@ TTFT, and TPOT under long-context recall are still being benchmarked.
 
 ## Verified setup
 
-The following single-node profiles were tested on eight NVIDIA RTX 6000D GPUs
-with the official Linux amd64 vLLM 0.34.0 image and a 131,072-token context limit.
+The following single-node profiles use eight NVIDIA RTX 6000D GPUs and the
+official Linux amd64 vLLM 0.34.0 image. The Flash rows use a 131,072-token
+context limit. The Full GLM-5.3 recipe uses 16,384 tokens and 32 sequences.
 
 | Checkpoint | Single-node profile | MTP draft tokens | GPU memory utilization | HiSparse host RAM |
 | --- | --- | ---: | ---: | --- |
@@ -90,6 +91,7 @@ with the official Linux amd64 vLLM 0.34.0 image and a 131,072-token context limi
 | GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP8 | 0 | 0.90 | 48 GiB per rank, 384 GiB total |
 | GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP8 | 3, opt-in | 0.92 | 2 GiB per rank, 16 GiB total |
 | GLM-5.3-Flash FP8 | TP8 + EP8 + DCP1 | 3 | 0.90 | One 384 GiB shared pool |
+| GLM-5.3 NVFP4 (Full) | TP8 + EP8 + DCP8 | 3 | 0.90 | 48 GiB per rank, 384 GiB total |
 
 The NVFP4 DCP8 MTP3 opt-in was tested with up to 16 configured sequences and
 positive host-to-device recall. Its C32 precision regression and the final
@@ -230,6 +232,22 @@ Use `attention='{"hisparse_config":{"indexer_block_size":2048}}'` and
 This profile uses the native shared pool and needs no external lease policy.
 For the FP8 compatibility profile, use the GLM-5.3-Flash FP8 checkpoint path
 with these same TP8/DCP1 settings and MTP3.
+
+### Full GLM-5.3 NVFP4 with TP8 + EP8 + DCP8
+
+Mount the Full ModelOpt NVFP4 checkpoint in the container and run the
+[Full GLM-5.3 example](examples/serve_glm53_full_nvfp4_dcp8.sh).
+
+```bash
+bash examples/serve_glm53_full_nvfp4_dcp8.sh /models/GLM-5.3-NVFP4
+```
+
+The example uses MTP3, packed FP8 MLA KV, and native 64-token blocks. Leave
+the HiSparse indexer layout at its default for this checkpoint. The 32-sequence
+GPU run covered 30 FULL CUDA Graph replays with 31 active requests. In a
+separate capacity run with MTP disabled, the eight-GPU KV allocation was
+128.94 → 133.03 GiB. With sufficient host RAM, this corresponds to 2.45 →
+28.36 Mi tokens of effective capacity, approximately 11.6×.
 
 ## Build the wheel from source
 

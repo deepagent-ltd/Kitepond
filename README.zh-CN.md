@@ -66,8 +66,8 @@ TPOT 仍在测试。
 
 ## 已验证的环境
 
-下表各单机构型均使用官方 Linux amd64 vLLM 0.34.0 镜像、8 张 NVIDIA RTX 6000D，
-上下文上限为 131,072 token。
+下表各单机构型均使用官方 Linux amd64 vLLM 0.34.0 镜像和 8 张 NVIDIA RTX 6000D。
+Flash 构型的上下文上限为 131,072 token。完整版 GLM-5.3 示例为 16,384 token，最多 32 条序列。
 
 | 权重 | 单机构型 | MTP 草稿 token 数 | GPU 显存利用率 | HiSparse 主存 |
 | --- | --- | ---: | ---: | --- |
@@ -76,6 +76,7 @@ TPOT 仍在测试。
 | GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP8 | 0 | 0.90 | 每个 rank 48 GiB，共 384 GiB |
 | GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP8 | 3，显式启用 | 0.92 | 每个 rank 2 GiB，共 16 GiB |
 | GLM-5.3-Flash FP8 | TP8 + EP8 + DCP1 | 3 | 0.90 | 共享 384 GiB |
+| GLM-5.3 NVFP4（完整版） | TP8 + EP8 + DCP8 | 3 | 0.90 | 每个 rank 48 GiB，共 384 GiB |
 
 NVFP4 的 DCP8 MTP3 构型在最大序列数设为 16 时验证了主存到显存的实际召回。
 C32 精度回归和最终 WHL 仍待验收。
@@ -202,6 +203,20 @@ decode context parallel size 保持为 1。设置
 `transfer='{"kv_connector":"HiSparseConnector","kv_role":"kv_both","kv_connector_extra_config":{"host_pool_gib":384}}'`。
 这个构型使用原生共享池，无需外部租约 policy。
 使用 FP8 权重时，将模型路径换成 GLM-5.3-Flash FP8，保留上述 TP8/DCP1 设置并启用 MTP3。
+
+### 完整版 GLM-5.3 NVFP4 使用 TP8 + EP8 + DCP8
+
+将完整版 ModelOpt NVFP4 权重挂载到容器，运行
+[完整版 GLM-5.3 启动示例](examples/serve_glm53_full_nvfp4_dcp8.sh)。
+
+```bash
+bash examples/serve_glm53_full_nvfp4_dcp8.sh /models/GLM-5.3-NVFP4
+```
+
+示例使用 MTP3、紧凑 FP8 MLA KV 和原生 64-token 块，HiSparse 索引布局使用模型默认值。
+32 路实机测试覆盖了 30 次 31 条活动请求落入 32 档 FULL CUDA Graph 的回放。
+独立的 MTP 关闭容量测试中，八卡实际 KV 池为 128.94 → 133.03 GiB。主存充足时，
+整机有效容量为 2.45 → 28.36 Mi token，约 11.6 倍。
 
 ## 从源码构建 WHL
 
