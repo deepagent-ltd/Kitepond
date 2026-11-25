@@ -66,23 +66,27 @@ TPOT 仍在测试。
 
 ## 已验证的环境
 
-以下启动方法使用官方 Linux amd64 vLLM 0.34.0 镜像、8 张 NVIDIA RTX 6000D 和
-GLM-5.3-Flash NVFP4 权重。表中各构型均在 GPU 显存利用率 90%、上下文上限 131,072 token
-的条件下通过请求生成验证。
+下表各单机构型均使用官方 Linux amd64 vLLM 0.34.0 镜像、8 张 NVIDIA RTX 6000D，
+上下文上限为 131,072 token。
 
-| 单机构型 | MTP 草稿 token 数 | HiSparse 主存 |
-| --- | ---: | --- |
-| DP8 + EP8 | 3 | 每个 DP rank 48 GiB，共 384 GiB |
-| TP8 + EP8 + DCP1 | 3 | 共享 384 GiB |
-| TP8 + EP8 + DCP8 | 0 | 每个 rank 48 GiB，共 384 GiB |
+| 权重 | 单机构型 | MTP 草稿 token 数 | GPU 显存利用率 | HiSparse 主存 |
+| --- | --- | ---: | ---: | --- |
+| GLM-5.3-Flash NVFP4 | DP8 + EP8 | 3 | 0.90 | 每个 DP rank 48 GiB，共 384 GiB |
+| GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP1 | 3 | 0.90 | 共享 384 GiB |
+| GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP8 | 0 | 0.90 | 每个 rank 48 GiB，共 384 GiB |
+| GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP8 | 3，显式启用 | 0.92 | 每个 rank 2 GiB，共 16 GiB |
+| GLM-5.3-Flash FP8 | TP8 + EP8 + DCP1 | 3 | 0.90 | 共享 384 GiB |
+
+NVFP4 的 DCP8 MTP3 构型在最大序列数设为 16 时验证了主存到显存的实际召回。
+C32 精度回归和最终 WHL 仍待验收。
 
 为模型加载、工作进程和操作系统另留主存。DP8 的请求及其 KV 都留在被分配的 DP rank。
 本文覆盖单机服务。其他权重、GPU 和 P/D 部署需单独验证。
 
 ## 安装和运行 WHL
 
-从 v0.2.0 起可在对应的 [GitHub Release](https://github.com/deepagent-ltd/Kitepond/releases)
-下载 WHL 和 `SHA256SUMS`。
+试用 0.2.0 源码分支时，请按下文[从源码构建 WHL](#从源码构建-whl)。
+正式发布的 WHL 与 SHA-256 校验文件见 [GitHub Releases](https://github.com/deepagent-ltd/Kitepond/releases)。
 
 在 GPU 宿主机上准备 `kitepond-0.2.0-py3-none-any.whl` 和完整的模型权重。
 替换示例中的两个本地路径后启动容器。
@@ -197,6 +201,7 @@ decode context parallel size 保持为 1。设置
 `attention='{"hisparse_config":{"indexer_block_size":2048}}'` 和
 `transfer='{"kv_connector":"HiSparseConnector","kv_role":"kv_both","kv_connector_extra_config":{"host_pool_gib":384}}'`。
 这个构型使用原生共享池，无需外部租约 policy。
+使用 FP8 权重时，将模型路径换成 GLM-5.3-Flash FP8，保留上述 TP8/DCP1 设置并启用 MTP3。
 
 ## 从源码构建 WHL
 

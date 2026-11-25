@@ -80,16 +80,20 @@ TTFT, and TPOT under long-context recall are still being benchmarked.
 
 ## Verified setup
 
-The launch instructions below use the official Linux amd64 vLLM 0.34.0 image,
-eight NVIDIA RTX 6000D GPUs, and the GLM-5.3-Flash NVFP4 checkpoint.
-Each profile passed request generation at 90% GPU memory utilization and a
-131,072-token context limit.
+The following single-node profiles were tested on eight NVIDIA RTX 6000D GPUs
+with the official Linux amd64 vLLM 0.34.0 image and a 131,072-token context limit.
 
-| Single-node profile | MTP draft tokens | HiSparse host RAM |
-| --- | ---: | --- |
-| DP8 + EP8 | 3 | 48 GiB per DP rank, 384 GiB total |
-| TP8 + EP8 + DCP1 | 3 | One 384 GiB shared pool |
-| TP8 + EP8 + DCP8 | 0 | 48 GiB per rank, 384 GiB total |
+| Checkpoint | Single-node profile | MTP draft tokens | GPU memory utilization | HiSparse host RAM |
+| --- | --- | ---: | ---: | --- |
+| GLM-5.3-Flash NVFP4 | DP8 + EP8 | 3 | 0.90 | 48 GiB per DP rank, 384 GiB total |
+| GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP1 | 3 | 0.90 | One 384 GiB shared pool |
+| GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP8 | 0 | 0.90 | 48 GiB per rank, 384 GiB total |
+| GLM-5.3-Flash NVFP4 | TP8 + EP8 + DCP8 | 3, opt-in | 0.92 | 2 GiB per rank, 16 GiB total |
+| GLM-5.3-Flash FP8 | TP8 + EP8 + DCP1 | 3 | 0.90 | One 384 GiB shared pool |
+
+The NVFP4 DCP8 MTP3 opt-in was tested with up to 16 configured sequences and
+positive host-to-device recall. Its C32 precision regression and the final
+wheel qualification are pending.
 
 Allow additional host RAM for the model loader, workers, and operating
 system. DP8 requests and their KV remain on their assigned DP rank. The
@@ -98,8 +102,9 @@ GPUs, and P/D deployment require separate qualification.
 
 ## Install and run the wheel
 
-From v0.2.0 onward, download the WHL and `SHA256SUMS` from the matching
-[GitHub Release](https://github.com/deepagent-ltd/Kitepond/releases).
+To try the 0.2.0 source branch, [build the wheel below](#build-the-wheel-from-source).
+Published wheels and SHA-256 checksums appear under
+[GitHub Releases](https://github.com/deepagent-ltd/Kitepond/releases).
 
 Have `kitepond-0.2.0-py3-none-any.whl` and the complete model checkpoint on
 the GPU host. Set the two paths in this example and start the container.
@@ -223,6 +228,8 @@ both data parallel sizes to 1. Keep decode context parallel size at 1.
 Use `attention='{"hisparse_config":{"indexer_block_size":2048}}'` and
 `transfer='{"kv_connector":"HiSparseConnector","kv_role":"kv_both","kv_connector_extra_config":{"host_pool_gib":384}}'`.
 This profile uses the native shared pool and needs no external lease policy.
+For the FP8 compatibility profile, use the GLM-5.3-Flash FP8 checkpoint path
+with these same TP8/DCP1 settings and MTP3.
 
 ## Build the wheel from source
 
